@@ -34,16 +34,17 @@ Hermes / Claude Code / Codex / 其他 MCP Client
 
 ## 当前状态
 
-这是可运行的 `0.1.0` MVP，已经验证：
+`0.1.0` MVP，已在真实场景中验证（百度/小红书/GitHub 搜索、批量笔记正文提取、结构化数据收集）：
 
 - Windows Node.js MCP 握手与工具发现；
 - 自动发现 OpenCLIApp 内置的 OpenCLI Node 入口；
 - OpenCLI daemon 和 Chrome Extension 实时连通；
-- 真实 Chrome 中打开 `example.com`；
+- 真实 Chrome 中打开任意网站；
 - DOM snapshot、标题读取；
 - 带 ref 标注的 PNG 截图，并作为 MCP image content 返回；
 - Browser session 清理；
-- 包含中文、引号、换行和 `&` 的文本保持为单个 argv，不经过 shell。
+- 包含中文、引号、换行和 `&` 的文本保持为单个 argv，不经过 shell；
+- 失败诊断、懒加载自动重试、零配置侦察、语义化压缩、get/read 拆分等通用优化。
 
 ## 前置条件
 
@@ -156,13 +157,14 @@ agent:
 
 | 工具 | 说明 |
 |---|---|
-| `browser_open` | 打开 URL，支持前台/后台窗口 |
+| `browser_open` | 打开 URL，支持前台/后台窗口；失败时附带 DNS/timeout/unknown 诊断 |
 | `browser_bind` | 绑定/解绑用户当前 Chrome 标签页 |
 | `browser_snapshot` | 完整 DOM 或 AX 快照和 refs |
-| `browser_snapshot_compact` | 未知/嘈杂网站的限长快照；保留头尾与 refs，并明确报告被省略的中间内容 |
-| `browser_find` | CSS/role/name/label/text/testid 查询 |
-| `browser_get` | title/url/text/value/attributes/html；text/value/attributes 的 CSS selector 会映射为 OpenCLI 位置参数 |
-| `browser_collect` | 用声明式 CSS 字段从重复卡片/表格/Feed 中一次收集结构化记录；支持 discover 侦察、fallback_text、deduplicate_by 和 exclude 过滤 |
+| `browser_snapshot_compact` | 未知/嘈杂网站的限长快照；语义化压缩优先保留内容行，省略导航/页脚等 chrome |
+| `browser_find` | CSS/role/name/label/text/testid 查询；`nth` 在 MCP 层本地选择 |
+| `browser_get` | 只读页面状态：title/url/value/attributes |
+| `browser_read` | 内容提取：text/html；找不到元素时自动 scroll + retry 触发懒加载；失败返回诊断 |
+| `browser_collect` | 用声明式 CSS 字段从重复卡片/表格/Feed 收集结构化记录；支持 discover 侦察、fallback_text、deduplicate_by、exclude 过滤；selector 匹配 0 时自动进入 discover |
 | `browser_extract` | Markdown 长文分块提取 |
 | `browser_screenshot` | PNG MCP image，支持 ref 标注和全页截图 |
 | `browser_frames` | 列出 iframe targets |
@@ -203,6 +205,45 @@ match_level: exact | stable | reidentified
 - tier 0（默认）：内容就绪条件（如 selector、text）；
 - tier 1+：兜底条件（如 URL、title）；
 - 当多个条件同时匹配时，tier 值最小的获胜。
+- 超时返回 `diagnosis`，报告最后页面状态、url、title，以及每个条件的具体修复建议。
+
+### 失败诊断
+
+所有可能失败的工具在失败时返回结构化 `diagnosis`：
+
+```json
+{
+  "diagnosis": {
+    "issue": "selector_no_match",
+    "hint": "Selector \"#bad\" matched 0 elements.",
+    "suggestions": [
+      "Use browser_collect with discover:true to find candidate selectors.",
+      "Or use browser_snapshot to inspect the page structure."
+    ]
+  }
+}
+```
+
+覆盖范围：
+
+- `browser_collect` 返回 0 条：区分 `selector_no_match` / `all_filtered`；
+- `browser_wait_any` 超时：报告最后的 url/title 和每个条件的修复建议；
+- `browser_fill_submit` 失败：区分 `target_not_found` / `invalid_selector` / `event_only_no_submit`；
+- `browser_open` 失败：区分 `navigation_timeout` / `dns_error` / `unknown_error`；
+- `browser_read` 返回空：提示"可能需要滚动触发懒加载"。
+
+### 懒加载自动处理
+
+`browser_read` 默认开启 `auto_scroll_retry: true`：
+
+```
+读不到目标元素
+→ 自动 scroll down
+→ 等待元素出现（最多 5 秒）
+→ 重试读取
+```
+
+适用于 turbo-frame、Intersection Observer 等 SPA 常见懒加载场景，模型不需要知道底层机制。
 
 ### 有界批量流程
 
@@ -220,23 +261,20 @@ match_level: exact | stable | reidentified
 - `find + save_as` 可保存唯一 ref，后续用 `$变量名` 引用；
 - 当前 OpenCLI `find` 不接受 `--nth`，MCP 会先获取候选，再在本地选择第 N 项；
 - 必需步骤失败时默认并行捕获 URL、title 和最多 6,000 字符的 compact snapshot；可用 `on_error_capture=false` 关闭；
-- `browser_collect` 支持 `discover: true` 侦察模式，探测页面重复模式并返回候选 selector 和样本数据；
-- `browser_collect` 的 `fallback_text: true` 在字段 selector 返回空时自动回退读取 root 的 innerText；
-- `browser_collect` 支持 `deduplicate_by` 按字段去重和 `exclude` 按标题/链接/文本过滤。
+- `collect` 步骤支持 `discover`、`fallback_text`、`deduplicate_by`、`exclude`，与独立工具一致；
+- `get` 步骤使用 `browser_read` 语义，自动支持懒加载重试和诊断。
 
-示例：
+示例（GitHub 搜索 → 提取前 3 条结果）：
 
 ```json
 {
-  "session": "research",
+  "session": "github-research",
   "max_steps": 5,
   "max_total_ms": 30000,
   "steps": [
-    {"operation":"open","url":"https://example.com"},
-    {"operation":"find","role":"link","name":"Learn more","save_as":"more"},
-    {"operation":"action","action":"click","target":"$more"},
-    {"operation":"wait","type":"text","value":"IANA-managed Reserved Domains"},
-    {"operation":"snapshot","compact":true,"max_chars":8000}
+    {"operation":"open","url":"https://github.com/search?q=agent+browser&type=repositories"},
+    {"operation":"wait_any","conditions":[{"type":"selector","value":"[data-testid=results-list]"}]},
+    {"operation":"collect","selector":"[data-testid=results-list] > div","limit":3,"fields":[{"name":"repo","selector":"h3 a","property":"text"},{"name":"href","selector":"h3 a","property":"href"}],"save_as":"results"}
   ]
 }
 ```
@@ -249,7 +287,7 @@ match_level: exact | stable | reidentified
 | `browser_console` | Console/JS errors |
 | `browser_eval` | 页面或跨域 frame 中执行只读 JS |
 | `browser_wait` | 单个 selector/text/time/xhr/download 条件 |
-| `browser_wait_any` | URL/title/selector/文本条件任一满足即返回，并报告获胜条件 |
+| `browser_wait_any` | URL/title/selector/文本条件任一满足即返回，并报告获胜条件；超时返回诊断 |
 | `browser_dialog` | accept/dismiss JS dialog |
 | `browser_tabs` | list/new/select/close |
 | `browser_back` | 后退 |
@@ -269,15 +307,23 @@ opencli_list
 
 ```text
 browser_open
-→ browser_snapshot_compact（首次侦察）
-→ 根据当前状态规划 2～5 步短 browser_flow
-→ 在关键页面变化后再次 compact snapshot
-→ browser_network(filter=..., limit=20)
-→ browser_network(detail=...)
-→ browser_eval（定向验证）
+→ browser_collect(discover=true)         REM 一次性侦察候选 selector
+→ browser_collect(selector=..., fields=...)  REM 精确采集
+→ browser_snapshot_compact               REM 内容未知时才做完整快照
+→ browser_read(selector=..., auto_scroll_retry=true)  REM 提取正文
 ```
 
-未知网页不建议一次盲跑完整任务。优先采用“短 flow → 检查 partial trace/新状态 → 再规划”；已知且确定性的 click/wait/snapshot 尾部再合并执行。
+失败时不需要额外调用诊断工具——相关工具会直接返回 `diagnosis` 字段，说明问题（如 `selector_no_match`）和修复建议（如 `discover:true`）。
+
+### 已知站点批量采集
+
+```text
+browser_fill_submit(target=#search, value=query, submit_strategy=form)
+→ browser_wait_any(conditions=[{selector:#results, tier:0}, {text:..., tier:1}])
+→ browser_collect(selector=#results > .item, fields=[...], deduplicate_by=title, exclude={...})
+```
+
+一次 flow 可完成 open → submit → wait → collect。
 
 ### 绑定用户已打开的页面
 
@@ -341,12 +387,15 @@ hermes-default
 3. Windows MCP 不能直接把 WSL `/tmp/...` 当作上传路径；上传前应复制到 Windows 可访问目录。
 4. 当前 OpenCLIApp 自动发现使用其 bundled package，GUI App 版本和 bundled CLI 版本可能相差一个补丁版本；`opencli_status` 会报告实际被调用的版本。
 5. 目前不自动修改 Hermes 配置，也不自动禁用内建 browser。
+6. Hermes MCP client 会把 `boolean` 和 `object` 参数序列化为字符串；相关工具的 schema 已改为 `z.union([z.boolean(), z.string()])` 并在 handler 内强制转换，调用方无需关心。
+7. GitHub 等站点的 README 在 `<turbo-frame>` 内延迟加载；`browser_read` 的 `auto_scroll_retry` 默认能处理，但极慢的网络下可能需要调大 `timeout_ms`。
+8. 语义化压缩按行级特征分类（`content` / `chrome`）；对没有明确标签语义的纯文本流可能效果不明显。
 
 ## 测试
 
 ```bat
 npm run check       REM JavaScript 语法检查
-npm test            REM 参数映射、无 shell 注入、错误处理
+npm test            REM 参数映射、无 shell 注入、错误处理、诊断、压缩、fill/submit/wait/collect
 npm run test:mcp    REM MCP 握手、工具发现、OpenCLI version
 npm run test:live   REM OpenCLI daemon/extension 实时诊断
 npm run test:browser      REM stdio: Chrome open/snapshot/get/screenshot/close
