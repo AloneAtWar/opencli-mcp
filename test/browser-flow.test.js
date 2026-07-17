@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   compactSnapshotData,
   executeBrowserFlow,
+  normalizeWaitData,
   paginateNetworkData,
 } from "../src/browser-flow.js";
 
@@ -19,6 +20,11 @@ test("compacts noisy snapshots with explicit omission metadata", () => {
   assert.doesNotMatch(result.value, /page_css/);
   assert.match(result.value, /Continue/);
   assert.match(result.value, /compact snapshot/);
+});
+
+test("normalizes OpenCLI time-wait output to milliseconds", () => {
+  assert.equal(normalizeWaitData("Waited 1500s", "time", "1500"), "Waited 1500ms");
+  assert.equal(normalizeWaitData("Text appeared", "text", "hello"), "Text appeared");
 });
 
 test("paginates network entries and returns a cursor", () => {

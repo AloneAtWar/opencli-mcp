@@ -73,6 +73,16 @@ export function paginateNetworkData(data, options = {}) {
   };
 }
 
+export function normalizeWaitData(data, type, value) {
+  if (type !== "time") return data;
+  const waitedMs = Number(value);
+  if (!Number.isFinite(waitedMs) || waitedMs < 0) return data;
+  if (typeof data === "string" && /^Waited\s+\S+s$/i.test(data.trim())) {
+    return `Waited ${waitedMs}ms`;
+  }
+  return data;
+}
+
 function buildSnapshotArgs(step, session) {
   const args = browserArgs(session, "state");
   if (step.source === "ax") args.push("--source", "ax");
@@ -197,6 +207,9 @@ async function executeStep(run, step, session, variables, timeoutMs) {
       throw new Error(`Unsupported browser_flow operation: ${step.operation}`);
   }
   const result = await run(args, { timeoutMs });
+  if (step.operation === "wait") {
+    result.data = normalizeWaitData(result.data, step.type, step.value);
+  }
   if (compactOptions) {
     const compacted = compactSnapshotData(result.data, compactOptions);
     return { ...result, data: compacted.value, compact: compacted };

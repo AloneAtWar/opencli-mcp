@@ -7,6 +7,7 @@ import {
   buildWaitArgsForAction,
   compactSnapshotData,
   executeBrowserFlow,
+  normalizeWaitData,
   paginateNetworkData,
 } from "./browser-flow.js";
 import {
@@ -358,7 +359,7 @@ export function createServer(options = {}) {
           buildWaitArgsForAction(input.wait_for, session, input.tab),
           { timeoutMs: timeout + 5_000 },
         );
-        combined.wait = waitResult.data;
+        combined.wait = normalizeWaitData(waitResult.data, input.wait_for.type, input.wait_for.value);
       }
       if (input.snapshot_after) {
         const snapshotResult = await run(buildSnapshotArgsForAction(input.snapshot_after, session, input.tab));
@@ -421,7 +422,9 @@ export function createServer(options = {}) {
       if (value !== undefined) args.push(value);
       appendOption(args, "--timeout", timeout_ms);
       appendTab(args, tab);
-      return successResult(await run(args, { timeoutMs: timeout_ms + 10_000 }));
+      const result = await run(args, { timeoutMs: timeout_ms + 10_000 });
+      result.data = normalizeWaitData(result.data, type, value);
+      return successResult(result);
     }),
   );
 

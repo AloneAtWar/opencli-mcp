@@ -29,6 +29,8 @@ try {
   if (flow.isError || flow.structuredContent?.status !== "completed") throw new Error(JSON.stringify(flow.structuredContent));
 
   await client.callTool({ name: "browser_open", arguments: { session, url: "https://example.com", window: "background" } });
+  const timeWait = await client.callTool({ name: "browser_wait", arguments: { session, type: "time", value: "10", timeout_ms: 1000 } });
+  if (timeWait.structuredContent?.value !== "Waited 10ms") throw new Error(`wait unit normalization failed: ${JSON.stringify(timeWait.structuredContent)}`);
   const found = await client.callTool({ name: "browser_find", arguments: { session, role: "link", name: "Learn more", limit: 5 } });
   const ref = found.structuredContent?.entries?.[0]?.ref;
   const combinedAction = await client.callTool({
@@ -59,6 +61,7 @@ try {
     completedSteps: flow.structuredContent.completed_steps,
     elapsedMs: flow.structuredContent.elapsed_ms,
     savedRef: flow.structuredContent.variables?.more,
+    waitUnit: timeWait.structuredContent?.value,
     lastHasIana: String(flow.structuredContent.last).includes("IANA"),
     combinedAction: {
       waited: Boolean(combinedAction.structuredContent?.wait),
