@@ -93,25 +93,38 @@ D:\devlopment\opencli-mcp\start.cmd
 
 `stdout` 专用于 MCP 协议；诊断日志只写入 `stderr`。
 
-## Hermes 配置
+## Hermes 配置（推荐：本地 Streamable HTTP）
 
-在 WSL 中，长驻 MCP stdio 进程必须使用 **WSL 原生 Node.js**。不要使用 `cmd.exe /c start.cmd`，也不要直接把 Windows `node.exe` 配成 MCP command：两者都可能通过工具发现，但 Gateway 随后丢失 stdio resource，真实调用报 `ClosedResourceError`。
+Hermes Gateway 与第三方 Node MCP 使用长期 stdio 时，实际环境中出现过：`hermes mcp test` 能发现全部工具，但 Gateway 随后持有已关闭 resource，真实调用报 `ClosedResourceError`。因此 Gateway 推荐通过 **loopback-only Streamable HTTP** 连接，由 systemd user service 独立管理 MCP 生命周期。
 
-本项目会在 WSL Server 内自动发现 Windows OpenCLIApp 和 Windows fnm Node；只有短生命周期的 OpenCLI 子进程跨越 WSL→Windows，参数仍通过 `spawn(argv, {shell:false})` 传递：
+安装服务：
+
+```bash
+cp examples/opencli-mcp.service ~/.config/systemd/user/opencli-mcp.service
+systemctl --user daemon-reload
+systemctl --user enable --now opencli-mcp.service
+curl http://127.0.0.1:31999/health
+```
+
+Hermes 配置：
 
 ```yaml
 mcp_servers:
   opencli_browser:
-    command: /home/alone/.local/share/fnm/node-versions/v24.14.1/installation/bin/node
-    args:
-      - /mnt/d/devlopment/opencli-mcp/bin/opencli-mcp.js
+    url: http://127.0.0.1:31999/mcp
     timeout: 180
     connect_timeout: 60
     sampling:
       enabled: false
 ```
 
-WSL Node 版本目录可通过 `which node` 和 `fnm list` 确认。如果升级 Node，请同步修改 `command`。在纯 Windows MCP Client 中仍可使用 `start.cmd`。
+验证：
+
+```bash
+hermes mcp test opencli_browser
+```
+
+服务只监听 `127.0.0.1`；除非自行增加认证，否则代码会拒绝非 loopback bind。纯 Windows MCP Client 或不受该生命周期问题影响的客户端仍可使用 stdio `start.cmd`。
 
 完整示例见 [`examples/hermes-config.yaml`](examples/hermes-config.yaml)。重启 Hermes 后，工具名会带 MCP Server 前缀，例如：
 
@@ -276,7 +289,9 @@ npm run check       REM JavaScript 语法检查
 npm test            REM 参数映射、无 shell 注入、错误处理
 npm run test:mcp    REM MCP 握手、工具发现、OpenCLI version
 npm run test:live   REM OpenCLI daemon/extension 实时诊断
-npm run test:browser REM 真实 Chrome open/snapshot/get/screenshot/close
+npm run test:browser      REM stdio: Chrome open/snapshot/get/screenshot/close
+npm run test:http         REM Streamable HTTP 握手、工具发现、OpenCLI version
+npm run test:http-browser REM HTTP: Chrome open/snapshot/get/screenshot/close
 ```
 
 `test:browser` 会短暂创建一个后台 OpenCLI session，访问 `https://example.com`，验证后释放 session。

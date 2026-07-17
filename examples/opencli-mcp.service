@@ -1,0 +1,16 @@
+[Unit]
+Description=OpenCLI MCP Streamable HTTP Server
+After=default.target
+
+[Service]
+Type=simple
+WorkingDirectory=/mnt/d/devlopment/opencli-mcp
+ExecStart=/home/alone/.local/share/fnm/node-versions/v24.14.1/installation/bin/node /mnt/d/devlopment/opencli-mcp/bin/opencli-mcp-http.js
+Environment=OPENCLI_MCP_HOST=127.0.0.1
+Environment=OPENCLI_MCP_PORT=31999
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target

@@ -1,17 +1,19 @@
-# Add this block to ~/.hermes/config.yaml, then restart Hermes.
-# Keep the persistent Hermes↔MCP stdio process Linux-native. The WSL MCP server
-# auto-discovers OpenCLIApp and a Windows fnm node.exe for short-lived OpenCLI
-# children. Do not configure cmd.exe or Windows node.exe as the MCP command:
-# discovery may pass while real Gateway calls fail with ClosedResourceError.
+# Recommended Hermes Gateway configuration.
+# opencli-mcp runs as a loopback-only systemd user service, avoiding lifecycle
+# coupling between the Gateway and a long-lived stdio subprocess.
 mcp_servers:
   opencli_browser:
-    command: /home/alone/.local/share/fnm/node-versions/v24.14.1/installation/bin/node
-    args:
-      - /mnt/d/devlopment/opencli-mcp/bin/opencli-mcp.js
+    url: http://127.0.0.1:31999/mcp
     timeout: 180
     connect_timeout: 60
     sampling:
       enabled: false
+
+# Install the service from examples/opencli-mcp.service, then:
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now opencli-mcp.service
+#   curl http://127.0.0.1:31999/health
+#   hermes mcp test opencli_browser
 
 # After the MCP replacement has passed real-world testing, the built-in browser
 # toolset can optionally be disabled.

@@ -4,20 +4,25 @@
   "description": "AI-native MCP tools backed by the OpenCLI CLI and its Chrome Browser Bridge",
   "type": "module",
   "bin": {
-    "opencli-mcp": "bin/opencli-mcp.js"
+    "opencli-mcp": "bin/opencli-mcp.js",
+    "opencli-mcp-http": "bin/opencli-mcp-http.js"
   },
   "exports": {
     ".": "./src/server.js",
+    "./http": "./src/http-server.js",
     "./runner": "./src/opencli-runner.js",
     "./commands": "./src/commands.js"
   },
   "scripts": {
     "start": "node bin/opencli-mcp.js",
+    "start:http": "node bin/opencli-mcp-http.js",
     "test": "node --test test/*.test.js",
     "test:mcp": "node scripts/mcp-smoke.js",
     "test:live": "node scripts/opencli-live-smoke.js",
     "test:browser": "node scripts/browser-smoke.js",
     "test:launcher": "node scripts/start-cmd-smoke.js",
+    "test:http": "node scripts/http-smoke.js",
+    "test:http-browser": "node scripts/http-browser-smoke.js",
     "check": "node --check src/server.js && node --check src/commands.js && node --check src/opencli-runner.js"
   },
   "engines": {
