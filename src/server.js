@@ -311,8 +311,9 @@ export function createServer(options = {}) {
     },
     wrap(async (input) => {
       const args = browserArgs(input.session, "get", input.property);
-      if (input.target !== undefined && input.property !== "html") args.push(String(input.target));
-      appendOption(args, "--selector", input.selector);
+      const positionalTarget = input.target ?? (input.property !== "html" ? input.selector : undefined);
+      if (positionalTarget !== undefined && input.property !== "html") args.push(String(positionalTarget));
+      if (input.property === "html") appendOption(args, "--selector", input.selector);
       appendOption(args, "--as", input.as);
       appendOption(args, "--depth", input.depth);
       appendOption(args, "--children-max", input.children_max);

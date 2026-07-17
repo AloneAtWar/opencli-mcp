@@ -161,7 +161,7 @@ agent:
 | `browser_snapshot` | 完整 DOM 或 AX 快照和 refs |
 | `browser_snapshot_compact` | 未知/嘈杂网站的限长快照；保留头尾与 refs，并明确报告被省略的中间内容 |
 | `browser_find` | CSS/role/name/label/text/testid 查询 |
-| `browser_get` | title/url/text/value/attributes/html |
+| `browser_get` | title/url/text/value/attributes/html；text/value/attributes 的 CSS selector 会映射为 OpenCLI 位置参数 |
 | `browser_extract` | Markdown 长文分块提取 |
 | `browser_screenshot` | PNG MCP image，支持 ref 标注和全页截图 |
 | `browser_frames` | 列出 iframe targets |

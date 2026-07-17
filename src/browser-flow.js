@@ -1,3 +1,4 @@
+import { performance } from "node:perf_hooks";
 import {
   appendFlag,
   appendLocator,
@@ -134,8 +135,9 @@ function buildFindArgs(step, session) {
 
 function buildGetArgs(step, session, target) {
   const args = browserArgs(session, "get", step.property);
-  if (target !== undefined && step.property !== "html") args.push(String(target));
-  appendOption(args, "--selector", step.selector);
+  const positionalTarget = target ?? (step.property !== "html" ? step.selector : undefined);
+  if (positionalTarget !== undefined && step.property !== "html") args.push(String(positionalTarget));
+  if (step.property === "html") appendOption(args, "--selector", step.selector);
   appendOption(args, "--as", step.as);
   appendOption(args, "--depth", step.depth);
   appendOption(args, "--children-max", step.children_max);
@@ -252,6 +254,8 @@ export async function executeBrowserFlow(run, input) {
 
   const totalMs = input.max_total_ms ?? 30_000;
   const started = Date.now();
+  const startedMonotonic = performance.now();
+  const elapsed = () => Math.max(0, Math.round(performance.now() - startedMonotonic));
   const deadline = started + totalMs;
   const trace = [];
   const variables = {};
@@ -262,11 +266,11 @@ export async function executeBrowserFlow(run, input) {
     const id = step.id || `step_${index + 1}`;
     const remaining = deadline - Date.now();
     if (remaining <= 0) {
-      return { status: "timeout", session, completed_steps: index, failed_step: id, elapsed_ms: Date.now() - started, trace, variables, last };
+      return { status: "timeout", session, completed_steps: index, failed_step: id, elapsed_ms: elapsed(), trace, variables, last };
     }
     const configuredStepTimeout = step.timeout_ms ?? DEFAULT_STEP_TIMEOUT_MS;
     const attempts = Math.min((step.retry ?? 0) + 1, 2);
-    const stepStarted = Date.now();
+    const stepStarted = performance.now();
     let error;
 
     for (let attempt = 1; attempt <= attempts; attempt += 1) {
@@ -277,7 +281,7 @@ export async function executeBrowserFlow(run, input) {
         const result = await executeStep(run, step, session, variables, attemptTimeout);
         last = result.data;
         if (step.save_as) variables[step.save_as] = variableValue(result.data);
-        trace.push({ id, operation: step.operation, status: "success", attempt, elapsed_ms: Date.now() - stepStarted, result: resultSummary(result.data) });
+        trace.push({ id, operation: step.operation, status: "success", attempt, elapsed_ms: Math.max(0, Math.round(performance.now() - stepStarted)), result: resultSummary(result.data) });
         error = null;
         break;
       } catch (caught) {
@@ -287,15 +291,15 @@ export async function executeBrowserFlow(run, input) {
     }
 
     if (error) {
-      const failed = { id, operation: step.operation, status: step.optional ? "skipped" : "failed", elapsed_ms: Date.now() - stepStarted, error: { name: error.name, message: error.message } };
+      const failed = { id, operation: step.operation, status: step.optional ? "skipped" : "failed", elapsed_ms: Math.max(0, Math.round(performance.now() - stepStarted)), error: { name: error.name, message: error.message } };
       trace.push(failed);
       if (!step.optional) {
-        return { status: "stopped", session, completed_steps: index, failed_step: id, elapsed_ms: Date.now() - started, trace, variables, last };
+        return { status: "stopped", session, completed_steps: index, failed_step: id, elapsed_ms: elapsed(), trace, variables, last };
       }
     }
   }
 
-  return { status: "completed", session, completed_steps: steps.length, elapsed_ms: Date.now() - started, trace, variables, last };
+  return { status: "completed", session, completed_steps: steps.length, elapsed_ms: elapsed(), trace, variables, last };
 }
 
 export function buildWaitArgsForAction(waitFor, session, tab) {

@@ -83,6 +83,21 @@ test("executes a bounded flow and resolves saved refs", async () => {
   assert.match(result.last, /Done/);
 });
 
+test("maps get text selector to the positional target required by OpenCLI", async () => {
+  let received;
+  const run = async (args) => {
+    received = args;
+    return { data: "detail body" };
+  };
+  const result = await executeBrowserFlow(run, {
+    session: "get-selector",
+    steps: [{ operation: "get", property: "text", selector: "#detail-desc", save_as: "body" }],
+  });
+  assert.equal(result.status, "completed");
+  assert.deepEqual(received, ["browser", "get-selector", "get", "text", "#detail-desc"]);
+  assert.equal(result.variables.body, "detail body");
+});
+
 test("stops with a partial trace on a required failure", async () => {
   const run = async (args) => {
     if (args.includes("open")) return { data: { url: "https://example.com" } };
