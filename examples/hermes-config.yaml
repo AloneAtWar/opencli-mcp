@@ -1,20 +1,19 @@
 # Add this block to ~/.hermes/config.yaml, then restart Hermes.
-# The MCP process runs under Windows while Hermes remains in WSL.
+# Hermes runs in WSL but launches Windows node.exe directly through WSL interop.
+# Do not use cmd.exe /c start.cmd for a long-lived Hermes MCP stdio server: tool
+# discovery may succeed while later calls fail with ClosedResourceError.
 mcp_servers:
   opencli_browser:
-    command: "cmd.exe"
+    command: /mnt/c/Users/alone/AppData/Roaming/fnm/node-versions/v24.14.0/installation/node.exe
     args:
-      - "/d"
-      - "/s"
-      - "/c"
-      - "D:\\devlopment\\opencli-mcp\\start.cmd"
+      - D:\devlopment\opencli-mcp\bin\opencli-mcp.js
     timeout: 180
     connect_timeout: 60
     sampling:
       enabled: false
 
 # After the MCP replacement has passed real-world testing, the built-in browser
-# toolset can optionally be disabled. Keep it enabled during the migration.
+# toolset can optionally be disabled.
 # agent:
 #   disabled_toolsets:
 #     - browser
