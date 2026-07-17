@@ -24,7 +24,8 @@
     "test:http": "node scripts/http-smoke.js",
     "test:http-browser": "node scripts/http-browser-smoke.js",
     "test:http-flow": "node scripts/http-flow-smoke.js",
-    "check": "node --check src/server.js && node --check src/browser-flow.js && node --check src/http-server.js && node --check src/commands.js && node --check src/opencli-runner.js"
+    "test:http-advanced": "node scripts/http-advanced-smoke.js",
+    "check": "node --check src/server.js && node --check src/browser-flow.js && node --check src/browser-advanced.js && node --check src/http-server.js && node --check src/commands.js && node --check src/opencli-runner.js"
   },
   "engines": {
     "node": ">=20"

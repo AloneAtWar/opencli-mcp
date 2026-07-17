@@ -1,4 +1,5 @@
 import { performance } from "node:perf_hooks";
+import { executeCollect, executeFillSubmit, executeWaitAny } from "./browser-advanced.js";
 import {
   appendFlag,
   appendLocator,
@@ -172,8 +173,9 @@ function variableValue(data) {
     if (data.ref !== undefined) return data.ref;
     if (data.value !== undefined && ["string", "number"].includes(typeof data.value)) return data.value;
   }
-  if (["string", "number"].includes(typeof data)) return data;
-  throw new Error("save_as could not derive a scalar/ref value from this step result");
+  if (["string", "number", "boolean"].includes(typeof data)) return data;
+  if (data && typeof data === "object") return data;
+  throw new Error("save_as could not derive a value from this step result");
 }
 
 function resultSummary(data) {
@@ -185,6 +187,7 @@ function resultSummary(data) {
       keys: Object.keys(data).slice(0, 20),
       matches: data.matches_n,
       entries: Array.isArray(data.entries) ? data.entries.length : undefined,
+      items: Array.isArray(data.items) ? data.items.length : undefined,
       url: data.url,
       title: data.title,
     };
@@ -192,8 +195,51 @@ function resultSummary(data) {
   return { type: typeof data, value: data };
 }
 
+async function captureFailureState(run, session, captureInput) {
+  if (captureInput === false) return null;
+  const config = captureInput && typeof captureInput === "object" ? captureInput : {};
+  const timeoutMs = config.timeout_ms ?? 5_000;
+  const tasks = {};
+  if (config.url !== false) tasks.url = run(browserArgs(session, "get", "url"), { timeoutMs });
+  if (config.title !== false) tasks.title = run(browserArgs(session, "get", "title"), { timeoutMs });
+  if (config.snapshot !== false) tasks.snapshot = run(buildSnapshotArgs({ source: config.source ?? "dom" }, session), { timeoutMs });
+  const names = Object.keys(tasks);
+  const settled = await Promise.allSettled(Object.values(tasks));
+  const capture = {};
+  for (let index = 0; index < names.length; index += 1) {
+    const name = names[index];
+    const result = settled[index];
+    if (result.status === "fulfilled") {
+      if (name === "snapshot") {
+        const compact = compactSnapshotData(result.value.data, {
+          maxChars: config.max_chars ?? 6_000,
+          maxLines: config.max_lines ?? 300,
+          omitDataTextareas: config.omit_data_textareas,
+        });
+        capture.snapshot = compact.value;
+        capture.snapshot_meta = { ...compact };
+        delete capture.snapshot_meta.value;
+      } else {
+        capture[name] = result.value.data;
+      }
+    } else {
+      capture[`${name}_error`] = result.reason?.message || String(result.reason);
+    }
+  }
+  return capture;
+}
+
 async function executeStep(run, step, session, variables, timeoutMs) {
   const target = resolveTarget(step.target, variables);
+  if (step.operation === "fill_submit") {
+    return await executeFillSubmit(run, { ...step, session, target }, { timeoutMs });
+  }
+  if (step.operation === "wait_any") {
+    return await executeWaitAny(run, { ...step, session }, { timeoutMs });
+  }
+  if (step.operation === "collect") {
+    return await executeCollect(run, { ...step, session }, { timeoutMs });
+  }
   let args;
   let compactOptions;
   switch (step.operation) {
@@ -266,7 +312,8 @@ export async function executeBrowserFlow(run, input) {
     const id = step.id || `step_${index + 1}`;
     const remaining = deadline - Date.now();
     if (remaining <= 0) {
-      return { status: "timeout", session, completed_steps: index, failed_step: id, elapsed_ms: elapsed(), trace, variables, last };
+      const capture = await captureFailureState(run, session, input.on_error_capture);
+      return { status: "timeout", session, completed_steps: index, failed_step: id, elapsed_ms: elapsed(), trace, variables, last, capture };
     }
     const configuredStepTimeout = step.timeout_ms ?? DEFAULT_STEP_TIMEOUT_MS;
     const attempts = Math.min((step.retry ?? 0) + 1, 2);
@@ -291,10 +338,11 @@ export async function executeBrowserFlow(run, input) {
     }
 
     if (error) {
-      const failed = { id, operation: step.operation, status: step.optional ? "skipped" : "failed", elapsed_ms: Math.max(0, Math.round(performance.now() - stepStarted)), error: { name: error.name, message: error.message } };
+      const failed = { id, operation: step.operation, status: step.optional ? "skipped" : "failed", elapsed_ms: Math.max(0, Math.round(performance.now() - stepStarted)), error: { name: error.name, message: error.message, last_state: error.lastState } };
       trace.push(failed);
       if (!step.optional) {
-        return { status: "stopped", session, completed_steps: index, failed_step: id, elapsed_ms: elapsed(), trace, variables, last };
+        const capture = await captureFailureState(run, session, input.on_error_capture);
+        return { status: "stopped", session, completed_steps: index, failed_step: id, elapsed_ms: elapsed(), trace, variables, last, capture };
       }
     }
   }

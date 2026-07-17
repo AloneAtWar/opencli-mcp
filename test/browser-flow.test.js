@@ -118,6 +118,25 @@ test("stops with a partial trace on a required failure", async () => {
   assert.equal(result.trace.at(-1).status, "failed");
 });
 
+test("captures URL, title, and compact snapshot after required failure", async () => {
+  const run = async (args) => {
+    if (args[2] === "click") throw new Error("click failed");
+    if (args.join(" ").includes("get url")) return { data: "https://example.com/failure" };
+    if (args.join(" ").includes("get title")) return { data: "Failure Page" };
+    if (args[2] === "state") return { data: "URL: https://example.com/failure\n<h1>Failure Page</h1>" };
+    throw new Error(`unexpected capture args: ${args.join(" ")}`);
+  };
+  const result = await executeBrowserFlow(run, {
+    session: "capture-failure",
+    steps: [{ id: "bad-click", operation: "action", action: "click", target: 1 }],
+    on_error_capture: { max_chars: 2000 },
+  });
+  assert.equal(result.status, "stopped");
+  assert.equal(result.capture.url, "https://example.com/failure");
+  assert.equal(result.capture.title, "Failure Page");
+  assert.match(result.capture.snapshot, /Failure Page/);
+});
+
 test("skips optional failures without looping", async () => {
   let calls = 0;
   const run = async (args) => {

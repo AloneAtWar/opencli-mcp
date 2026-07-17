@@ -162,6 +162,7 @@ agent:
 | `browser_snapshot_compact` | 未知/嘈杂网站的限长快照；保留头尾与 refs，并明确报告被省略的中间内容 |
 | `browser_find` | CSS/role/name/label/text/testid 查询 |
 | `browser_get` | title/url/text/value/attributes/html；text/value/attributes 的 CSS selector 会映射为 OpenCLI 位置参数 |
+| `browser_collect` | 用声明式 CSS 字段从重复卡片/表格/Feed 中一次收集结构化记录 |
 | `browser_extract` | Markdown 长文分块提取 |
 | `browser_screenshot` | PNG MCP image，支持 ref 标注和全页截图 |
 | `browser_frames` | 列出 iframe targets |
@@ -187,9 +188,15 @@ match_level: exact | stable | reidentified
 - `wait_for`：动作完成后等待 selector/text/time/xhr/download；
 - `snapshot_after`：等待后立即返回快照，默认压缩到 12,000 字符。
 
+`browser_fill_submit` 把“填值并提交”压成一次 MCP 调用：
+
+- CSS target 默认在一次页面执行中设置原生 input/textarea value、派发 input/change、聚焦并派发 Enter 键事件；
+- ref 或语义定位可设 `atomic=false`，回退为官方 CLI 的 `fill → focus → keys`；
+- 该工具保证提交事件被派发，后续仍应通过 `browser_wait_any` 验证导航或内容就绪。
+
 ### 有界批量流程
 
-`browser_flow` 在一次 MCP 调用内顺序执行短流程，支持 `open/find/action/wait/snapshot/get/back`。它仍通过官方 OpenCLI CLI 执行每一步，但减少 Agent↔MCP 往返。
+`browser_flow` 在一次 MCP 调用内顺序执行短流程，支持 `open/find/action/fill_submit/wait/wait_any/snapshot/get/collect/back`。它仍通过官方 OpenCLI CLI 执行每一步，但减少 Agent↔MCP 往返。
 
 关键安全边界：
 
@@ -201,7 +208,8 @@ match_level: exact | stable | reidentified
 - 必需步骤失败立即停止并返回 partial trace；
 - `optional=true` 的步骤失败后标记 skipped；
 - `find + save_as` 可保存唯一 ref，后续用 `$变量名` 引用；
-- 当前 OpenCLI `find` 不接受 `--nth`，MCP 会先获取候选，再在本地选择第 N 项。
+- 当前 OpenCLI `find` 不接受 `--nth`，MCP 会先获取候选，再在本地选择第 N 项；
+- 必需步骤失败时默认并行捕获 URL、title 和最多 6,000 字符的 compact snapshot；可用 `on_error_capture=false` 关闭。
 
 示例：
 
@@ -227,7 +235,8 @@ match_level: exact | stable | reidentified
 | `browser_network` | 请求 shape、失败请求、过滤、response body detail；列表默认 50 条，支持 `limit/offset` 分页 |
 | `browser_console` | Console/JS errors |
 | `browser_eval` | 页面或跨域 frame 中执行只读 JS |
-| `browser_wait` | selector/text/time/xhr/download |
+| `browser_wait` | 单个 selector/text/time/xhr/download 条件 |
+| `browser_wait_any` | URL/title/selector/文本条件任一满足即返回，并报告获胜条件 |
 | `browser_dialog` | accept/dismiss JS dialog |
 | `browser_tabs` | list/new/select/close |
 | `browser_back` | 后退 |
@@ -331,6 +340,7 @@ npm run test:browser      REM stdio: Chrome open/snapshot/get/screenshot/close
 npm run test:http         REM Streamable HTTP 握手、工具发现、OpenCLI version
 npm run test:http-browser REM HTTP: Chrome open/snapshot/get/screenshot/close
 npm run test:http-flow    REM HTTP: 6-step bounded flow + action(wait/snapshot)
+npm run test:http-advanced REM 小红书: atomic submit + wait_any + collect + failure capture
 ```
 
 `test:browser` 会短暂创建一个后台 OpenCLI session，访问 `https://example.com`，验证后释放 session。

@@ -2,6 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { createOpenCliRunner, OpenCliError } from "./opencli-runner.js";
+import { executeCollect, executeFillSubmit, executeWaitAny } from "./browser-advanced.js";
 import {
   buildSnapshotArgsForAction,
   buildWaitArgsForAction,
@@ -49,9 +50,29 @@ const snapshotAfterSchema = z.object({
   omit_data_textareas: z.boolean().default(true),
   tab: tabSchema,
 });
+const waitAnyConditionSchema = z.object({
+  type: z.enum(["url_contains", "title_contains", "selector", "text"]),
+  value: z.string().min(1),
+});
+const collectFieldSchema = z.object({
+  name: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,63}$/),
+  selector: z.string().optional(),
+  property: z.enum(["text", "href", "src", "value", "html", "attribute"]).default("text"),
+  attribute: z.string().regex(/^[A-Za-z_:][-A-Za-z0-9_:.]*$/).optional(),
+});
+const failureCaptureSchema = z.object({
+  url: z.boolean().default(true),
+  title: z.boolean().default(true),
+  snapshot: z.boolean().default(true),
+  source: z.enum(["dom", "ax"]).default("dom"),
+  max_chars: z.number().int().min(2_000).max(20_000).default(6_000),
+  max_lines: z.number().int().positive().max(1_000).default(300),
+  omit_data_textareas: z.boolean().default(true),
+  timeout_ms: z.number().int().positive().max(10_000).default(5_000),
+});
 const flowStepSchema = z.object({
   id: z.string().max(80).optional(),
-  operation: z.enum(["open", "find", "action", "wait", "snapshot", "get", "back"]),
+  operation: z.enum(["open", "find", "action", "fill_submit", "wait", "wait_any", "snapshot", "get", "collect", "back"]),
   optional: z.boolean().default(false),
   retry: z.number().int().min(0).max(1).default(0),
   timeout_ms: z.number().int().positive().max(60_000).default(10_000),
@@ -63,6 +84,7 @@ const flowStepSchema = z.object({
   target: z.union([z.string(), z.number()]).optional(),
   value: z.string().optional(),
   key: z.string().optional(),
+  atomic: z.boolean().optional(),
   direction: z.enum(["up", "down"]).optional(),
   amount: z.number().int().positive().optional(),
   files: z.array(z.string()).optional(),
@@ -79,8 +101,14 @@ const flowStepSchema = z.object({
   limit: z.number().int().positive().max(500).optional(),
   text_max: z.number().int().positive().max(10_000).optional(),
   type: z.enum(["selector", "text", "time", "xhr", "download"]).optional(),
+  conditions: z.array(waitAnyConditionSchema).min(1).max(8).optional(),
+  poll_ms: z.number().int().min(100).max(2_000).optional(),
   property: z.enum(["title", "url", "text", "value", "attributes", "html"]).optional(),
   selector: z.string().optional(),
+  fields: z.array(collectFieldSchema).min(1).max(20).optional(),
+  required_fields: z.array(z.string()).max(20).optional(),
+  offset: z.number().int().nonnegative().optional(),
+  max_field_chars: z.number().int().min(100).max(20_000).optional(),
   as: z.enum(["html", "json"]).optional(),
   depth: z.number().int().positive().optional(),
   children_max: z.number().int().positive().optional(),
@@ -325,6 +353,25 @@ export function createServer(options = {}) {
   );
 
   server.registerTool(
+    "browser_collect",
+    {
+      description: "Collect repeated page items into structured records using bounded CSS selectors. Safer and smaller than returning a full snapshot for feeds, tables, and search results.",
+      inputSchema: {
+        session: sessionSchema,
+        selector: z.string().min(1).describe("Root selector for repeated items/cards."),
+        fields: z.array(collectFieldSchema).min(1).max(20),
+        required_fields: z.array(z.string()).max(20).default([]),
+        offset: z.number().int().nonnegative().default(0),
+        limit: z.number().int().positive().max(100).default(20),
+        max_field_chars: z.number().int().min(100).max(20_000).default(2_000),
+        timeout_ms: z.number().int().positive().max(60_000).default(10_000),
+        tab: tabSchema,
+      },
+    },
+    wrap(async (input) => successResult(await executeCollect(run, { ...input, session: normalizeSession(input.session) }))),
+  );
+
+  server.registerTool(
     "browser_action",
     {
       description: "Perform a structured browser interaction. Prefer refs from browser_snapshot/find and inspect again after navigation or SPA changes.",
@@ -388,6 +435,24 @@ export function createServer(options = {}) {
   );
 
   server.registerTool(
+    "browser_fill_submit",
+    {
+      description: "Reliably fill a field and submit it in one MCP call by running fill → focus the same target → key press through official OpenCLI commands.",
+      inputSchema: {
+        session: sessionSchema,
+        target: targetSchema,
+        value: z.string().describe("Exact value to fill before submitting."),
+        key: z.string().default("Enter"),
+        atomic: z.boolean().default(true).describe("For CSS targets, set value and dispatch keyboard events in one page evaluation. Disable to use fill → focus → keys CLI fallback."),
+        ...locatorFields,
+        timeout_ms: z.number().int().positive().max(60_000).default(15_000),
+        tab: tabSchema,
+      },
+    },
+    wrap(async (input) => successResult(await executeFillSubmit(run, { ...input, session: normalizeSession(input.session) }))),
+  );
+
+  server.registerTool(
     "browser_flow",
     {
       description: "Execute a short, bounded browser flow inside one MCP call. Steps run sequentially through the official OpenCLI CLI, stop on the first required failure, and return a partial trace. No loops; retries are capped at one.",
@@ -397,6 +462,7 @@ export function createServer(options = {}) {
         steps: z.array(flowStepSchema).min(1).max(20),
         max_steps: z.number().int().min(1).max(20).default(8),
         max_total_ms: z.number().int().min(1_000).max(120_000).default(30_000),
+        on_error_capture: z.union([z.boolean(), failureCaptureSchema]).default(true).describe("Capture URL, title, and a compact snapshot after a required step fails."),
       },
     },
     wrap(async (input) => {
@@ -430,6 +496,21 @@ export function createServer(options = {}) {
       result.data = normalizeWaitData(result.data, type, value);
       return successResult(result);
     }),
+  );
+
+  server.registerTool(
+    "browser_wait_any",
+    {
+      description: "Wait until any bounded URL, title, selector, or visible-text condition matches. Uses read-only page checks and returns the winning condition.",
+      inputSchema: {
+        session: sessionSchema,
+        conditions: z.array(waitAnyConditionSchema).min(1).max(8),
+        timeout_ms: z.number().int().positive().max(120_000).default(15_000),
+        poll_ms: z.number().int().min(100).max(2_000).default(250),
+        tab: tabSchema,
+      },
+    },
+    wrap(async (input) => successResult(await executeWaitAny(run, { ...input, session: normalizeSession(input.session) }))),
   );
 
   server.registerTool(
