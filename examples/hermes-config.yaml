@@ -1,0 +1,20 @@
+# Add this block to ~/.hermes/config.yaml, then restart Hermes.
+# The MCP process runs under Windows while Hermes remains in WSL.
+mcp_servers:
+  opencli_browser:
+    command: "cmd.exe"
+    args:
+      - "/d"
+      - "/s"
+      - "/c"
+      - "D:\\devlopment\\opencli-mcp\\start.cmd"
+    timeout: 180
+    connect_timeout: 60
+    sampling:
+      enabled: false
+
+# After the MCP replacement has passed real-world testing, the built-in browser
+# toolset can optionally be disabled. Keep it enabled during the migration.
+# agent:
+#   disabled_toolsets:
+#     - browser

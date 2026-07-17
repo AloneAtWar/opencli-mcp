@@ -1,0 +1,38 @@
+{
+  "name": "opencli-mcp",
+  "version": "0.1.0",
+  "description": "AI-native MCP tools backed by the OpenCLI CLI and its Chrome Browser Bridge",
+  "type": "module",
+  "bin": {
+    "opencli-mcp": "bin/opencli-mcp.js"
+  },
+  "exports": {
+    ".": "./src/server.js",
+    "./runner": "./src/opencli-runner.js",
+    "./commands": "./src/commands.js"
+  },
+  "scripts": {
+    "start": "node bin/opencli-mcp.js",
+    "test": "node --test test/*.test.js",
+    "test:mcp": "node scripts/mcp-smoke.js",
+    "test:live": "node scripts/opencli-live-smoke.js",
+    "test:browser": "node scripts/browser-smoke.js",
+    "test:launcher": "node scripts/start-cmd-smoke.js",
+    "check": "node --check src/server.js && node --check src/commands.js && node --check src/opencli-runner.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "mcp",
+    "opencli",
+    "chrome",
+    "browser-automation",
+    "ai-agent"
+  ],
+  "license": "MIT",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "zod": "4.4.3"
+  }
+}
