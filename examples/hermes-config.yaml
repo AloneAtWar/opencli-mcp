@@ -1,12 +1,13 @@
 # Add this block to ~/.hermes/config.yaml, then restart Hermes.
-# Hermes runs in WSL but launches Windows node.exe directly through WSL interop.
-# Do not use cmd.exe /c start.cmd for a long-lived Hermes MCP stdio server: tool
-# discovery may succeed while later calls fail with ClosedResourceError.
+# Keep the persistent Hermes↔MCP stdio process Linux-native. The WSL MCP server
+# auto-discovers OpenCLIApp and a Windows fnm node.exe for short-lived OpenCLI
+# children. Do not configure cmd.exe or Windows node.exe as the MCP command:
+# discovery may pass while real Gateway calls fail with ClosedResourceError.
 mcp_servers:
   opencli_browser:
-    command: /mnt/c/Users/alone/AppData/Roaming/fnm/node-versions/v24.14.0/installation/node.exe
+    command: /home/alone/.local/share/fnm/node-versions/v24.14.1/installation/bin/node
     args:
-      - D:\devlopment\opencli-mcp\bin\opencli-mcp.js
+      - /mnt/d/devlopment/opencli-mcp/bin/opencli-mcp.js
     timeout: 180
     connect_timeout: 60
     sampling:

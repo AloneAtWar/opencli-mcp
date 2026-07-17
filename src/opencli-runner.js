@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import path from "node:path";
 
 const DEFAULT_TIMEOUT_MS = 90_000;
@@ -40,11 +40,74 @@ export function resolveOpenCli(env = process.env) {
     }
   }
 
+  if (process.platform === "linux" && existsSync("/mnt/c/Users")) {
+    const resolved = resolveWslWindowsOpenCli(env);
+    if (resolved) return resolved;
+  }
+
   throw new Error(
     "OpenCLI executable was not found. Set OPENCLI_MCP_BIN to a native executable " +
-      "and optionally OPENCLI_MCP_PREFIX_ARGS to a JSON string array. On Windows with " +
-      "OpenCLIApp installed, its bundled OpenCLI entrypoint is discovered automatically.",
+      "and optionally OPENCLI_MCP_PREFIX_ARGS to a JSON string array. OpenCLIApp is " +
+      "auto-discovered on native Windows and WSL when a Windows fnm Node installation exists.",
   );
+}
+
+function resolveWslWindowsOpenCli(env) {
+  const usersRoot = "/mnt/c/Users";
+  if (!existsSync(usersRoot)) return null;
+
+  const preferred = [env.OPENCLI_MCP_WINDOWS_USER, env.USER].filter(Boolean);
+  const discovered = readdirSync(usersRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name);
+  const users = [...new Set([...preferred, ...discovered])];
+
+  for (const user of users) {
+    const mountedHome = path.join(usersRoot, user);
+    const appMainMounted = path.join(
+      mountedHome,
+      "AppData",
+      "Local",
+      "OpenCLIApp",
+      "node_modules",
+      "@jackwener",
+      "opencli",
+      "dist",
+      "src",
+      "main.js",
+    );
+    if (!existsSync(appMainMounted)) continue;
+
+    const versionsRoot = path.join(mountedHome, "AppData", "Roaming", "fnm", "node-versions");
+    if (!existsSync(versionsRoot)) continue;
+    const versions = readdirSync(versionsRoot, { withFileTypes: true })
+      .filter((entry) => entry.isDirectory())
+      .map((entry) => entry.name)
+      .sort(compareVersionNames)
+      .reverse();
+
+    for (const version of versions) {
+      const windowsNodeMounted = path.join(versionsRoot, version, "installation", "node.exe");
+      if (!existsSync(windowsNodeMounted)) continue;
+      const appMainWindows = `C:\\Users\\${user}\\AppData\\Local\\OpenCLIApp\\node_modules\\@jackwener\\opencli\\dist\\src\\main.js`;
+      return {
+        command: windowsNodeMounted,
+        prefixArgs: [appMainWindows],
+        source: `WSL → Windows Node (${version}) → OpenCLIApp bundled entrypoint`,
+      };
+    }
+  }
+  return null;
+}
+
+function compareVersionNames(left, right) {
+  const a = left.replace(/^v/, "").split(".").map((part) => Number(part) || 0);
+  const b = right.replace(/^v/, "").split(".").map((part) => Number(part) || 0);
+  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+    const delta = (a[index] || 0) - (b[index] || 0);
+    if (delta !== 0) return delta;
+  }
+  return left.localeCompare(right);
 }
 
 function parsePrefixArgs(raw) {

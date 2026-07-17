@@ -95,23 +95,23 @@ D:\devlopment\opencli-mcp\start.cmd
 
 ## Hermes 配置
 
-在 WSL 中，**不要用 `cmd.exe /c start.cmd` 作为长驻 MCP stdio 入口**。Hermes 的 MCP watchdog 可以完成工具发现，但随后可能只剩一个已关闭的 stdio resource，实际调用报 `ClosedResourceError`。
+在 WSL 中，长驻 MCP stdio 进程必须使用 **WSL 原生 Node.js**。不要使用 `cmd.exe /c start.cmd`，也不要直接把 Windows `node.exe` 配成 MCP command：两者都可能通过工具发现，但 Gateway 随后丢失 stdio resource，真实调用报 `ClosedResourceError`。
 
-应直接从 WSL 启动 Windows `node.exe`，让 Windows Node 运行 MCP Server：
+本项目会在 WSL Server 内自动发现 Windows OpenCLIApp 和 Windows fnm Node；只有短生命周期的 OpenCLI 子进程跨越 WSL→Windows，参数仍通过 `spawn(argv, {shell:false})` 传递：
 
 ```yaml
 mcp_servers:
   opencli_browser:
-    command: /mnt/c/Users/alone/AppData/Roaming/fnm/node-versions/v24.14.0/installation/node.exe
+    command: /home/alone/.local/share/fnm/node-versions/v24.14.1/installation/bin/node
     args:
-      - D:\\devlopment\\opencli-mcp\\bin\\opencli-mcp.js
+      - /mnt/d/devlopment/opencli-mcp/bin/opencli-mcp.js
     timeout: 180
     connect_timeout: 60
     sampling:
       enabled: false
 ```
 
-Windows Node 版本目录可通过 Windows `fnm list` 确认。如果升级 Node，请同步修改 `command`。在纯 Windows MCP Client 中仍可使用 `start.cmd`。
+WSL Node 版本目录可通过 `which node` 和 `fnm list` 确认。如果升级 Node，请同步修改 `command`。在纯 Windows MCP Client 中仍可使用 `start.cmd`。
 
 完整示例见 [`examples/hermes-config.yaml`](examples/hermes-config.yaml)。重启 Hermes 后，工具名会带 MCP Server 前缀，例如：
 
