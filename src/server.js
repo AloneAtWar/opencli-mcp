@@ -53,6 +53,7 @@ const snapshotAfterSchema = z.object({
 const waitAnyConditionSchema = z.object({
   type: z.enum(["url_contains", "title_contains", "selector", "text"]),
   value: z.string().min(1),
+  tier: z.number().int().min(0).max(10).default(0).describe("Lower tier wins when multiple conditions match simultaneously. Use tier 0 for content-ready conditions, tier 1+ for fallbacks."),
 });
 const collectFieldSchema = z.object({
   name: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,63}$/),
@@ -103,6 +104,16 @@ const flowStepSchema = z.object({
   type: z.enum(["selector", "text", "time", "xhr", "download"]).optional(),
   conditions: z.array(waitAnyConditionSchema).min(1).max(8).optional(),
   poll_ms: z.number().int().min(100).max(2_000).optional(),
+  discover: z.boolean().optional(),
+  probe_selectors: z.array(z.string()).max(20).optional(),
+  fallback_text: z.boolean().optional(),
+  deduplicate_by: z.string().optional(),
+  exclude: z.union([z.string(), z.object({
+    title_contains: z.array(z.string()).optional(),
+    href_contains: z.array(z.string()).optional(),
+    text_contains: z.array(z.string()).optional(),
+  })]).optional(),
+  submit_strategy: z.enum(["form", "event", "both"]).optional(),
   property: z.enum(["title", "url", "text", "value", "attributes", "html"]).optional(),
   selector: z.string().optional(),
   fields: z.array(collectFieldSchema).min(1).max(20).optional(),
@@ -355,20 +366,36 @@ export function createServer(options = {}) {
   server.registerTool(
     "browser_collect",
     {
-      description: "Collect repeated page items into structured records using bounded CSS selectors. Safer and smaller than returning a full snapshot for feeds, tables, and search results.",
+      description: "Collect repeated page items into structured records using bounded CSS selectors. Supports discover mode for unknown sites, fuzzy fallback, deduplication, and exclude filters.",
       inputSchema: {
         session: sessionSchema,
-        selector: z.string().min(1).describe("Root selector for repeated items/cards."),
-        fields: z.array(collectFieldSchema).min(1).max(20),
+        selector: z.string().min(1).optional().describe("Root selector for repeated items/cards. Required unless discover=true."),
+        fields: z.array(collectFieldSchema).min(1).max(20).optional(),
         required_fields: z.array(z.string()).max(20).default([]),
         offset: z.number().int().nonnegative().default(0),
         limit: z.number().int().positive().max(100).default(20),
         max_field_chars: z.number().int().min(100).max(20_000).default(2_000),
+        discover: z.union([z.boolean(), z.string()]).default(false).describe("When true, probe common repeated DOM patterns and return candidate selectors with sample data instead of collecting."),
+        probe_selectors: z.array(z.string()).max(20).optional().describe("Custom selectors to try first in discover mode."),
+        fallback_text: z.union([z.boolean(), z.string()]).default(true).describe("When a field selector returns empty, fall back to the root element's innerText."),
+        deduplicate_by: z.string().optional().describe("Deduplicate results by this field name."),
+        exclude: z.union([z.string(), z.object({
+          title_contains: z.array(z.string()).optional(),
+          href_contains: z.array(z.string()).optional(),
+          text_contains: z.array(z.string()).optional(),
+        })]).optional().describe("Filter out items matching any of these substring conditions. Accepts object or JSON string."),
         timeout_ms: z.number().int().positive().max(60_000).default(10_000),
         tab: tabSchema,
       },
     },
-    wrap(async (input) => successResult(await executeCollect(run, { ...input, session: normalizeSession(input.session) }))),
+    wrap(async (input) => {
+      if (typeof input.exclude === "string") {
+        try { input.exclude = JSON.parse(input.exclude); } catch { input.exclude = undefined; }
+      }
+      input.discover = input.discover === true || input.discover === "true" || input.discover === "True";
+      input.fallback_text = input.fallback_text === undefined || input.fallback_text === true || input.fallback_text === "true" || input.fallback_text === "True";
+      return successResult(await executeCollect(run, { ...input, session: normalizeSession(input.session) }));
+    }),
   );
 
   server.registerTool(
@@ -444,12 +471,17 @@ export function createServer(options = {}) {
         value: z.string().describe("Exact value to fill before submitting."),
         key: z.string().default("Enter"),
         atomic: z.boolean().default(true).describe("For CSS targets, set value and dispatch keyboard events in one page evaluation. Disable to use fill → focus → keys CLI fallback."),
+        submit_strategy: z.enum(["form", "event", "both"]).default("form").describe("form: requestSubmit() if available. event: dispatch keyboard events only. both: dispatch events then try requestSubmit()."),
         ...locatorFields,
         timeout_ms: z.number().int().positive().max(60_000).default(15_000),
         tab: tabSchema,
       },
     },
-    wrap(async (input) => successResult(await executeFillSubmit(run, { ...input, session: normalizeSession(input.session) }))),
+    wrap(async (input) => {
+      input.atomic = input.atomic === true || input.atomic === "true" || input.atomic === "True";
+      input.submit_strategy = typeof input.submit_strategy === "string" ? input.submit_strategy : (input.submit_strategy ?? "form");
+      return successResult(await executeFillSubmit(run, { ...input, session: normalizeSession(input.session) }));
+    }),
   );
 
   server.registerTool(

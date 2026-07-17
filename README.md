@@ -162,7 +162,7 @@ agent:
 | `browser_snapshot_compact` | 未知/嘈杂网站的限长快照；保留头尾与 refs，并明确报告被省略的中间内容 |
 | `browser_find` | CSS/role/name/label/text/testid 查询 |
 | `browser_get` | title/url/text/value/attributes/html；text/value/attributes 的 CSS selector 会映射为 OpenCLI 位置参数 |
-| `browser_collect` | 用声明式 CSS 字段从重复卡片/表格/Feed 中一次收集结构化记录 |
+| `browser_collect` | 用声明式 CSS 字段从重复卡片/表格/Feed 中一次收集结构化记录；支持 discover 侦察、fallback_text、deduplicate_by 和 exclude 过滤 |
 | `browser_extract` | Markdown 长文分块提取 |
 | `browser_screenshot` | PNG MCP image，支持 ref 标注和全页截图 |
 | `browser_frames` | 列出 iframe targets |
@@ -191,8 +191,18 @@ match_level: exact | stable | reidentified
 `browser_fill_submit` 把“填值并提交”压成一次 MCP 调用：
 
 - CSS target 默认在一次页面执行中设置原生 input/textarea value、派发 input/change、聚焦并派发 Enter 键事件；
+- `submit_strategy` 支持三种模式：
+  - `form`（默认）：派发事件后尝试 `requestSubmit()`，适合百度等传统表单；
+  - `event`：只派发键盘事件，不触发表单提交，适合纯 JS 监听 Enter 的 SPA；
+  - `both`：先派发事件再尝试 `requestSubmit()`；
 - ref 或语义定位可设 `atomic=false`，回退为官方 CLI 的 `fill → focus → keys`；
 - 该工具保证提交事件被派发，后续仍应通过 `browser_wait_any` 验证导航或内容就绪。
+
+`browser_wait_any` 的条件支持 `tier` 优先级：
+
+- tier 0（默认）：内容就绪条件（如 selector、text）；
+- tier 1+：兜底条件（如 URL、title）；
+- 当多个条件同时匹配时，tier 值最小的获胜。
 
 ### 有界批量流程
 
@@ -209,7 +219,10 @@ match_level: exact | stable | reidentified
 - `optional=true` 的步骤失败后标记 skipped；
 - `find + save_as` 可保存唯一 ref，后续用 `$变量名` 引用；
 - 当前 OpenCLI `find` 不接受 `--nth`，MCP 会先获取候选，再在本地选择第 N 项；
-- 必需步骤失败时默认并行捕获 URL、title 和最多 6,000 字符的 compact snapshot；可用 `on_error_capture=false` 关闭。
+- 必需步骤失败时默认并行捕获 URL、title 和最多 6,000 字符的 compact snapshot；可用 `on_error_capture=false` 关闭；
+- `browser_collect` 支持 `discover: true` 侦察模式，探测页面重复模式并返回候选 selector 和样本数据；
+- `browser_collect` 的 `fallback_text: true` 在字段 selector 返回空时自动回退读取 root 的 innerText；
+- `browser_collect` 支持 `deduplicate_by` 按字段去重和 `exclude` 按标题/链接/文本过滤。
 
 示例：
 
