@@ -158,7 +158,8 @@ agent:
 |---|---|
 | `browser_open` | 打开 URL，支持前台/后台窗口 |
 | `browser_bind` | 绑定/解绑用户当前 Chrome 标签页 |
-| `browser_snapshot` | DOM 或 AX 快照和 refs |
+| `browser_snapshot` | 完整 DOM 或 AX 快照和 refs |
+| `browser_snapshot_compact` | 未知/嘈杂网站的限长快照；保留 refs，并明确报告省略内容 |
 | `browser_find` | CSS/role/name/label/text/testid 查询 |
 | `browser_get` | title/url/text/value/attributes/html |
 | `browser_extract` | Markdown 长文分块提取 |
@@ -181,13 +182,48 @@ matches_n
 match_level: exact | stable | reidentified
 ```
 
-页面跳转或 SPA route 变化后应重新执行 `browser_snapshot`。
+页面跳转或 SPA route 变化后应重新执行 `browser_snapshot`。`browser_action` 还支持：
+
+- `wait_for`：动作完成后等待 selector/text/time/xhr/download；
+- `snapshot_after`：等待后立即返回快照，默认压缩到 12,000 字符。
+
+### 有界批量流程
+
+`browser_flow` 在一次 MCP 调用内顺序执行短流程，支持 `open/find/action/wait/snapshot/get/back`。它仍通过官方 OpenCLI CLI 执行每一步，但减少 Agent↔MCP 往返。
+
+关键安全边界：
+
+- 默认最多 8 步，硬上限 20；
+- 默认总预算 30 秒，硬上限 120 秒；
+- 每步独立超时；
+- 不支持循环或 goto；
+- `retry` 只能为 0 或 1；
+- 必需步骤失败立即停止并返回 partial trace；
+- `optional=true` 的步骤失败后标记 skipped；
+- `find + save_as` 可保存唯一 ref，后续用 `$变量名` 引用。
+
+示例：
+
+```json
+{
+  "session": "research",
+  "max_steps": 5,
+  "max_total_ms": 30000,
+  "steps": [
+    {"operation":"open","url":"https://example.com"},
+    {"operation":"find","role":"link","name":"Learn more","save_as":"more"},
+    {"operation":"action","action":"click","target":"$more"},
+    {"operation":"wait","type":"text","value":"IANA-managed Reserved Domains"},
+    {"operation":"snapshot","compact":true,"max_chars":8000}
+  ]
+}
+```
 
 ### 探索与调试
 
 | 工具 | 说明 |
 |---|---|
-| `browser_network` | 请求 shape、失败请求、过滤、response body detail |
+| `browser_network` | 请求 shape、失败请求、过滤、response body detail；列表默认 50 条，支持 `limit/offset` 分页 |
 | `browser_console` | Console/JS errors |
 | `browser_eval` | 页面或跨域 frame 中执行只读 JS |
 | `browser_wait` | selector/text/time/xhr/download |
@@ -210,14 +246,15 @@ opencli_list
 
 ```text
 browser_open
-→ browser_snapshot
-→ browser_action
-→ browser_wait
-→ browser_snapshot
-→ browser_network
+→ browser_snapshot_compact（首次侦察）
+→ 根据当前状态规划 2～5 步短 browser_flow
+→ 在关键页面变化后再次 compact snapshot
+→ browser_network(filter=..., limit=20)
 → browser_network(detail=...)
 → browser_eval（定向验证）
 ```
+
+未知网页不建议一次盲跑完整任务。优先采用“短 flow → 检查 partial trace/新状态 → 再规划”；已知且确定性的 click/wait/snapshot 尾部再合并执行。
 
 ### 绑定用户已打开的页面
 
@@ -292,6 +329,7 @@ npm run test:live   REM OpenCLI daemon/extension 实时诊断
 npm run test:browser      REM stdio: Chrome open/snapshot/get/screenshot/close
 npm run test:http         REM Streamable HTTP 握手、工具发现、OpenCLI version
 npm run test:http-browser REM HTTP: Chrome open/snapshot/get/screenshot/close
+npm run test:http-flow    REM HTTP: 6-step bounded flow + action(wait/snapshot)
 ```
 
 `test:browser` 会短暂创建一个后台 OpenCLI session，访问 `https://example.com`，验证后释放 session。

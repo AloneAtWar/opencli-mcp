@@ -3,6 +3,13 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { z } from "zod";
 import { createOpenCliRunner, OpenCliError } from "./opencli-runner.js";
 import {
+  buildSnapshotArgsForAction,
+  buildWaitArgsForAction,
+  compactSnapshotData,
+  executeBrowserFlow,
+  paginateNetworkData,
+} from "./browser-flow.js";
+import {
   appendFlag,
   appendLocator,
   appendOption,
@@ -25,6 +32,62 @@ const locatorFields = {
   testid: z.string().optional(),
   nth: z.number().int().nonnegative().optional(),
 };
+const waitForSchema = z.object({
+  type: z.enum(["selector", "text", "time", "xhr", "download"]),
+  value: z.string().optional(),
+  timeout_ms: z.number().int().positive().max(60_000).default(10_000),
+  tab: tabSchema,
+});
+const snapshotAfterSchema = z.object({
+  source: z.enum(["dom", "ax"]).default("dom"),
+  compare_sources: z.boolean().default(false),
+  compact: z.boolean().default(true),
+  max_chars: z.number().int().min(2_000).max(100_000).default(12_000),
+  max_lines: z.number().int().positive().max(5_000).default(500),
+  omit_data_textareas: z.boolean().default(true),
+  tab: tabSchema,
+});
+const flowStepSchema = z.object({
+  id: z.string().max(80).optional(),
+  operation: z.enum(["open", "find", "action", "wait", "snapshot", "get", "back"]),
+  optional: z.boolean().default(false),
+  retry: z.number().int().min(0).max(1).default(0),
+  timeout_ms: z.number().int().positive().max(60_000).default(10_000),
+  save_as: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,63}$/).optional(),
+  tab: tabSchema,
+  url: z.string().optional(),
+  window: z.enum(["foreground", "background"]).optional(),
+  action: z.enum(["click", "hover", "focus", "dblclick", "check", "uncheck", "type", "fill", "select", "keys", "scroll", "upload", "drag"]).optional(),
+  target: z.union([z.string(), z.number()]).optional(),
+  value: z.string().optional(),
+  key: z.string().optional(),
+  direction: z.enum(["up", "down"]).optional(),
+  amount: z.number().int().positive().optional(),
+  files: z.array(z.string()).optional(),
+  source: z.union([z.enum(["dom", "ax"]), z.string(), z.number()]).optional(),
+  destination: z.union([z.string(), z.number()]).optional(),
+  from_nth: z.number().int().nonnegative().optional(),
+  to_nth: z.number().int().nonnegative().optional(),
+  from_role: z.string().optional(),
+  from_name: z.string().optional(),
+  to_role: z.string().optional(),
+  to_name: z.string().optional(),
+  css: z.string().optional(),
+  ...locatorFields,
+  limit: z.number().int().positive().max(500).optional(),
+  text_max: z.number().int().positive().max(10_000).optional(),
+  type: z.enum(["selector", "text", "time", "xhr", "download"]).optional(),
+  property: z.enum(["title", "url", "text", "value", "attributes", "html"]).optional(),
+  selector: z.string().optional(),
+  as: z.enum(["html", "json"]).optional(),
+  depth: z.number().int().positive().optional(),
+  children_max: z.number().int().positive().optional(),
+  compare_sources: z.boolean().optional(),
+  compact: z.boolean().optional(),
+  max_chars: z.number().int().min(2_000).max(100_000).optional(),
+  max_lines: z.number().int().positive().max(5_000).optional(),
+  omit_data_textareas: z.boolean().optional(),
+});
 
 function asJsonText(data) {
   return typeof data === "string" ? data : JSON.stringify(data, null, 2);
@@ -170,6 +233,38 @@ export function createServer(options = {}) {
   );
 
   server.registerTool(
+    "browser_snapshot_compact",
+    {
+      description: "Return a token-bounded page snapshot for unknown or noisy sites. Preserves refs while omitting data/style textareas and truncating with explicit omission metadata.",
+      inputSchema: {
+        session: sessionSchema,
+        source: z.enum(["dom", "ax"]).default("dom"),
+        compare_sources: z.boolean().default(false),
+        max_chars: z.number().int().min(2_000).max(100_000).default(12_000),
+        max_lines: z.number().int().positive().max(5_000).default(500),
+        omit_data_textareas: z.boolean().default(true),
+        tab: tabSchema,
+      },
+    },
+    wrap(async ({ session, source, compare_sources, max_chars, max_lines, omit_data_textareas, tab }) => {
+      const args = browserArgs(session, "state");
+      if (source === "ax") args.push("--source", "ax");
+      appendFlag(args, "--compare-sources", compare_sources);
+      appendTab(args, tab);
+      const result = await run(args);
+      const compact = compactSnapshotData(result.data, {
+        maxChars: max_chars,
+        maxLines: max_lines,
+        omitDataTextareas: omit_data_textareas,
+      });
+      return {
+        content: [{ type: "text", text: asJsonText(compact.value) }],
+        structuredContent: compact,
+      };
+    }),
+  );
+
+  server.registerTool(
     "browser_find",
     {
       description: "Find elements using a semantic locator or CSS and allocate stable OpenCLI refs.",
@@ -247,9 +342,66 @@ export function createServer(options = {}) {
         to_name: z.string().optional(),
         ...locatorFields,
         tab: tabSchema,
+        wait_for: waitForSchema.optional().describe("Optional bounded wait performed immediately after the action."),
+        snapshot_after: snapshotAfterSchema.optional().describe("Optional snapshot returned after the action/wait, compacted by default."),
       },
     },
-    wrap(async (input) => successResult(await run(buildActionArgs(input)))),
+    wrap(async (input) => {
+      const session = normalizeSession(input.session);
+      const actionResult = await run(buildActionArgs({ ...input, session }));
+      if (!input.wait_for && !input.snapshot_after) return successResult(actionResult);
+
+      const combined = { action: actionResult.data };
+      if (input.wait_for) {
+        const timeout = input.wait_for.timeout_ms;
+        const waitResult = await run(
+          buildWaitArgsForAction(input.wait_for, session, input.tab),
+          { timeoutMs: timeout + 5_000 },
+        );
+        combined.wait = waitResult.data;
+      }
+      if (input.snapshot_after) {
+        const snapshotResult = await run(buildSnapshotArgsForAction(input.snapshot_after, session, input.tab));
+        if (input.snapshot_after.compact !== false) {
+          const compact = compactSnapshotData(snapshotResult.data, {
+            maxChars: input.snapshot_after.max_chars,
+            maxLines: input.snapshot_after.max_lines,
+            omitDataTextareas: input.snapshot_after.omit_data_textareas,
+          });
+          combined.snapshot = compact.value;
+          combined.snapshot_meta = compact;
+          delete combined.snapshot_meta.value;
+        } else {
+          combined.snapshot = snapshotResult.data;
+        }
+      }
+      return {
+        content: [{ type: "text", text: asJsonText(combined) }],
+        structuredContent: combined,
+      };
+    }),
+  );
+
+  server.registerTool(
+    "browser_flow",
+    {
+      description: "Execute a short, bounded browser flow inside one MCP call. Steps run sequentially through the official OpenCLI CLI, stop on the first required failure, and return a partial trace. No loops; retries are capped at one.",
+      inputSchema: {
+        session: sessionSchema,
+        intent: z.string().max(500).optional(),
+        steps: z.array(flowStepSchema).min(1).max(20),
+        max_steps: z.number().int().min(1).max(20).default(8),
+        max_total_ms: z.number().int().min(1_000).max(120_000).default(30_000),
+      },
+    },
+    wrap(async (input) => {
+      const result = await executeBrowserFlow(run, input);
+      return {
+        content: [{ type: "text", text: asJsonText(result) }],
+        structuredContent: result,
+        isError: result.status !== "completed",
+      };
+    }),
   );
 
   server.registerTool(
@@ -310,6 +462,8 @@ export function createServer(options = {}) {
         until: z.string().optional(),
         max_body: z.number().int().nonnegative().optional(),
         ttl_ms: z.number().int().positive().optional(),
+        limit: z.number().int().positive().max(500).default(50).describe("Maximum request entries returned; use offset for pagination."),
+        offset: z.number().int().nonnegative().default(0),
         tab: tabSchema,
       },
     },
@@ -325,7 +479,13 @@ export function createServer(options = {}) {
       appendOption(args, "--max-body", input.max_body);
       appendOption(args, "--ttl", input.ttl_ms);
       appendTab(args, input.tab);
-      return successResult(await run(args));
+      const result = await run(args);
+      if (input.detail || input.raw) return successResult(result);
+      const paginated = paginateNetworkData(result.data, { limit: input.limit, offset: input.offset });
+      return {
+        content: [{ type: "text", text: asJsonText(paginated) }],
+        structuredContent: paginated && typeof paginated === "object" ? paginated : { value: paginated },
+      };
     }),
   );
 
