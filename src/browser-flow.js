@@ -1,5 +1,5 @@
 import { performance } from "node:perf_hooks";
-import { executeCollect, executeFillSubmit, executeWaitAny } from "./browser-advanced.js";
+import { executeCollect, executeFillSubmit, executeWaitAny, executeOpen, executeRead } from "./browser-advanced.js";
 import {
   appendFlag,
   appendLocator,
@@ -12,6 +12,26 @@ import {
 
 const DEFAULT_STEP_TIMEOUT_MS = 10_000;
 
+// Semantic section markers for priority-based compaction
+const SECTION_MARKERS = [
+  { tag: "<nav", priority: 9, label: "nav" },
+  { tag: "<header", priority: 8, label: "header" },
+  { tag: "<footer", priority: 8, label: "footer" },
+  { tag: "<aside", priority: 7, label: "aside" },
+  { tag: "[role=navigation", priority: 9, label: "nav" },
+  { tag: "[role=banner", priority: 8, label: "header" },
+  { tag: "[role=contentinfo", priority: 8, label: "footer" },
+];
+
+function classifyLine(line) {
+  const trimmed = line.trim();
+  if (/^\[?\d+\]?<nav\b|<header\b|<footer\b|<aside\b/.test(trimmed)) return "low";
+  if (/^\[?\d+\]?\s*<div\s/.test(trimmed) && /navigation|banner|contentinfo/i.test(trimmed)) return "low";
+  if (/^[=\-]{3,}\s*$/.test(trimmed)) return "separator";
+  if (/^\s*$/.test(trimmed)) return "blank";
+  return "content";
+}
+
 export function compactSnapshotData(data, options = {}) {
   if (typeof data !== "string") {
     return { value: data, compacted: false, originalChars: 0, returnedChars: 0, omittedChars: 0 };
@@ -19,54 +39,95 @@ export function compactSnapshotData(data, options = {}) {
   const maxChars = options.maxChars ?? 12_000;
   const maxLines = options.maxLines ?? 500;
   const omitDataTextareas = options.omitDataTextareas !== false;
+  const priority = options.priority; // e.g. ["readme", "content"]
+
   const lines = data.split(/\r?\n/);
-  const kept = [];
+  const classified = [];
   let omittedLines = 0;
 
   for (const line of lines) {
-    if (
-      omitDataTextareas &&
-      /<textarea\b/i.test(line) &&
-      /(css|style|data|json|schema|state|config)/i.test(line)
-    ) {
+    if (omitDataTextareas && /<textarea\b/i.test(line) && /(css|style|data|json|schema|state|config)/i.test(line)) {
       omittedLines += 1;
       continue;
     }
-    if (kept.length >= maxLines) {
+    if (classified.length >= maxLines) {
       omittedLines += 1;
       continue;
     }
-    kept.push(line.replace(/\s+$/g, ""));
+    const kind = classifyLine(line);
+    classified.push({ text: line.replace(/\s+$/g, ""), kind });
   }
 
-  let value = kept.join("\n").replace(/\n{4,}/g, "\n\n\n");
-  let truncated = false;
-  let middleOmittedChars = 0;
-  if (value.length > maxChars) {
-    truncated = true;
-    const markerReserve = 180;
-    const payloadBudget = Math.max(1, maxChars - markerReserve);
-    const headBudget = Math.floor(payloadBudget * 0.35);
-    const tailBudget = payloadBudget - headBudget;
-    let head = value.slice(0, headBudget).replace(/\n[^\n]*$/, "");
-    let tail = value.slice(-tailBudget).replace(/^[^\n]*\n/, "");
-    middleOmittedChars = Math.max(0, value.length - head.length - tail.length);
-    const marker = `\n---\n[compact snapshot: omitted ${middleOmittedChars} middle char(s); head and tail preserved]\n---\n`;
-    value = `${head}${marker}${tail}`;
-    if (value.length > maxChars) value = value.slice(0, maxChars);
+  const totalChars = classified.reduce((s, l) => s + l.text.length + 1, 0);
+
+  // If it fits, return everything
+  if (totalChars <= maxChars && classified.length <= maxLines) {
+    const value = classified.map((l) => l.text).join("\n").replace(/\n{4,}/g, "\n\n\n");
+    return { value, compacted: omittedLines > 0, originalChars: data.length, returnedChars: value.length, omittedChars: data.length - value.length, omittedLines };
   }
-  const omittedChars = Math.max(0, data.length - value.length);
-  if (omittedLines > 0 && !truncated) {
-    const marker = `\n---\n[compact snapshot: omitted ${omittedLines} line(s), ${omittedChars} char(s); request a larger limit or full browser_snapshot if needed]`;
-    value = `${value.slice(0, Math.max(0, maxChars - marker.length))}${marker}`;
+
+  // Priority-based filling: keep all "content" lines, drop "low" lines first
+  const markerReserve = 200;
+  const budget = maxChars - markerReserve;
+
+  // Split into content (high priority) and chrome (low priority)
+  const contentLines = classified.filter((l) => l.kind === "content" || l.kind === "separator");
+  const chromeLines = classified.filter((l) => l.kind === "low" || l.kind === "blank");
+
+  const contentChars = contentLines.reduce((s, l) => s + l.text.length + 1, 0);
+
+  if (contentChars <= budget) {
+    // All content fits; fill remaining budget with chrome lines from both ends
+    let remaining = budget - contentChars;
+    const kept = [...contentLines];
+    // Add chrome from tail (footer etc.) until budget
+    for (let i = chromeLines.length - 1; i >= 0 && remaining > 0; i--) {
+      const cost = chromeLines[i].text.length + 1;
+      if (cost <= remaining) {
+        kept.splice(kept.length, 0, chromeLines[i]);
+        remaining -= cost;
+      }
+    }
+    const value = kept.map((l) => l.text).join("\n").replace(/\n{4,}/g, "\n\n\n").slice(0, maxChars);
+    const omittedChars = Math.max(0, data.length - value.length);
+    const marker = omittedChars > 0 ? `\n---\n[compact snapshot: omitted ${omittedChars} char(s); content preserved, chrome trimmed]\n---\n` : "";
+    const final = value.length > maxChars ? value.slice(0, maxChars) : value + marker;
+    return {
+      value: final.slice(0, maxChars),
+      compacted: true,
+      originalChars: data.length,
+      returnedChars: Math.min(final.length, maxChars),
+      omittedChars,
+      omittedLines: classified.length - contentLines.length,
+      content_lines: contentLines.length,
+      chrome_lines: chromeLines.length,
+    };
   }
+
+  // Content exceeds budget: take first N content lines that fit
+  let charsUsed = 0;
+  const kept = [];
+  for (const line of contentLines) {
+    const cost = line.text.length + 1;
+    if (charsUsed + cost > budget) break;
+    kept.push(line);
+    charsUsed += cost;
+  }
+
+  const value = kept.map((l) => l.text).join("\n").replace(/\n{4,}/g, "\n\n\n");
+  const marker = `\n---\n[compact snapshot: kept ${kept.length}/${contentLines.length} content lines, ${chromeLines.length} chrome lines omitted; ${(data.length - value.length)} chars omitted]\n---\n`;
+  const final = value.slice(0, Math.max(0, maxChars - marker.length)) + marker;
+
   return {
-    value,
-    compacted: omittedLines > 0 || truncated,
+    value: final,
+    compacted: true,
     originalChars: data.length,
-    returnedChars: value.length,
-    omittedChars,
-    omittedLines,
+    returnedChars: final.length,
+    omittedChars: data.length - final.length,
+    omittedLines: classified.length - kept.length,
+    content_lines: kept.length,
+    chrome_lines: chromeLines.length,
+    note: "Content exceeds budget. Some content lines were truncated.",
   };
 }
 
@@ -240,13 +301,17 @@ async function executeStep(run, step, session, variables, timeoutMs) {
   if (step.operation === "collect") {
     return await executeCollect(run, { ...step, session }, { timeoutMs });
   }
+  if (step.operation === "open") {
+    if (!step.url) throw new Error("browser_flow open requires url");
+    return await executeOpen(run, { ...step, session }, { timeoutMs });
+  }
+  if (step.operation === "get") {
+    if (!step.property) throw new Error("browser_flow get requires property");
+    return await executeRead(run, { ...step, session, target }, { timeoutMs });
+  }
   let args;
   let compactOptions;
   switch (step.operation) {
-    case "open":
-      if (!step.url) throw new Error("browser_flow open requires url");
-      args = buildOpenArgs(step, session);
-      break;
     case "find":
       args = buildFindArgs(step, session);
       break;
@@ -265,10 +330,6 @@ async function executeStep(run, step, session, variables, timeoutMs) {
         maxLines: step.max_lines ?? 500,
         omitDataTextareas: step.omit_data_textareas,
       };
-      break;
-    case "get":
-      if (!step.property) throw new Error("browser_flow get requires property");
-      args = buildGetArgs(step, session, target);
       break;
     case "back":
       args = browserArgs(session, "back");

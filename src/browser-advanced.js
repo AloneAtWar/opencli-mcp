@@ -1,11 +1,28 @@
 import { performance } from "node:perf_hooks";
 import { appendTab, browserArgs, buildActionArgs } from "./commands.js";
+import {
+  diagnoseCollect,
+  diagnoseFillSubmit,
+  diagnoseGetNull,
+  diagnoseOpen,
+  diagnoseWaitTimeout,
+  attachDiagnosis,
+} from "./browser-diagnostics.js";
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 function remainingMs(deadline, fallback = 5_000) {
   return Math.max(1, Math.min(fallback, Math.round(deadline - performance.now())));
 }
+
+function unwrapEval(data) {
+  if (data && typeof data === "object" && data.value && typeof data.value === "object") return data.value;
+  return data;
+}
+
+// ─────────────────────────────────────────────
+// fill_submit
+// ─────────────────────────────────────────────
 
 export async function executeFillSubmit(run, input, options = {}) {
   const timeoutMs = options.timeoutMs ?? input.timeout_ms ?? 10_000;
@@ -20,7 +37,10 @@ export async function executeFillSubmit(run, input, options = {}) {
     appendTab(args, input.tab);
     const result = await run(args, { timeoutMs });
     const data = unwrapEval(result.data);
-    if (!data?.ok) throw new Error(`fill_submit failed: ${data?.error || "unknown DOM error"}`);
+    if (!data?.ok) {
+      const diagnosis = diagnoseFillSubmit(data, input);
+      throw Object.assign(new Error(`fill_submit failed: ${data?.error || "unknown DOM error"}`), { diagnosis });
+    }
     return { ...result, data: { ...data, mode: "atomic-dom-event" } };
   }
 
@@ -36,28 +56,11 @@ export async function executeFillSubmit(run, input, options = {}) {
     tab: input.tab,
   };
 
-  const fill = await run(
-    buildActionArgs({ ...shared, action: "fill", value: input.value }),
-    { timeoutMs: remainingMs(deadline, timeoutMs) },
-  );
-  const focus = await run(
-    buildActionArgs({ ...shared, action: "focus" }),
-    { timeoutMs: remainingMs(deadline, timeoutMs) },
-  );
-  const keys = await run(
-    buildActionArgs({ session, action: "keys", key, tab: input.tab }),
-    { timeoutMs: remainingMs(deadline, timeoutMs) },
-  );
+  const fill = await run(buildActionArgs({ ...shared, action: "fill", value: input.value }), { timeoutMs: remainingMs(deadline, timeoutMs) });
+  const focus = await run(buildActionArgs({ ...shared, action: "focus" }), { timeoutMs: remainingMs(deadline, timeoutMs) });
+  const keys = await run(buildActionArgs({ session, action: "keys", key, tab: input.tab }), { timeoutMs: remainingMs(deadline, timeoutMs) });
 
-  return {
-    data: {
-      filled: fill.data,
-      focused: focus.data,
-      submitted: keys.data,
-      key,
-      mode: "cli-fallback",
-    },
-  };
+  return { data: { filled: fill.data, focused: focus.data, submitted: keys.data, key, mode: "cli-fallback" } };
 }
 
 export function buildFillSubmitExpression(input) {
@@ -67,18 +70,17 @@ export function buildFillSubmitExpression(input) {
     key: input.key ?? "Enter",
     submitStrategy: input.submit_strategy ?? "form",
   });
-  return `(()=>{const config=${config};let element;try{element=document.querySelector(config.selector);}catch{return {ok:false,error:'invalid_selector'};}if(!element)return {ok:false,error:'target_not_found'};const prototype=element instanceof HTMLTextAreaElement?HTMLTextAreaElement.prototype:element instanceof HTMLInputElement?HTMLInputElement.prototype:Object.getPrototypeOf(element);const descriptor=Object.getOwnPropertyDescriptor(prototype,'value');if(descriptor?.set)descriptor.set.call(element,config.value);else element.value=config.value;element.dispatchEvent(new Event('input',{bubbles:true}));element.dispatchEvent(new Event('change',{bubbles:true}));element.focus();const init={key:config.key,code:config.key==='Enter'?'Enter':config.key,bubbles:true,cancelable:true};const proceed=element.dispatchEvent(new KeyboardEvent('keydown',init));element.dispatchEvent(new KeyboardEvent('keypress',init));element.dispatchEvent(new KeyboardEvent('keyup',init));let formSubmitted=false;const shouldSubmit=config.submitStrategy==='form'||config.submitStrategy==='both';const shouldDispatchEvent=config.submitStrategy==='event'||config.submitStrategy==='both';if(shouldSubmit&&proceed&&element.form){element.form.requestSubmit();formSubmitted=true;}const activeAfterSubmit=document.activeElement===element;const focused=activeAfterSubmit?'n/a-submit-handled':(document.activeElement?.tagName||'unknown');return {ok:true,filled:element.value===config.value,value:element.value,key:config.key,focused,events_dispatched:true,form_submitted:formSubmitted,submit_strategy:config.submitStrategy};})()`;
+  return `(()=>{const config=${config};let element;try{element=document.querySelector(config.selector);}catch{return {ok:false,error:'invalid_selector'};}if(!element)return {ok:false,error:'target_not_found'};const prototype=element instanceof HTMLTextAreaElement?HTMLTextAreaElement.prototype:element instanceof HTMLInputElement?HTMLInputElement.prototype:Object.getPrototypeOf(element);const descriptor=Object.getOwnPropertyDescriptor(prototype,'value');if(descriptor?.set)descriptor.set.call(element,config.value);else element.value=config.value;element.dispatchEvent(new Event('input',{bubbles:true}));element.dispatchEvent(new Event('change',{bubbles:true}));element.focus();const init={key:config.key,code:config.key==='Enter'?'Enter':config.key,bubbles:true,cancelable:true};const proceed=element.dispatchEvent(new KeyboardEvent('keydown',init));element.dispatchEvent(new KeyboardEvent('keypress',init));element.dispatchEvent(new KeyboardEvent('keyup',init));let formSubmitted=false;const shouldSubmit=config.submitStrategy==='form'||config.submitStrategy==='both';if(shouldSubmit&&proceed&&element.form){element.form.requestSubmit();formSubmitted=true;}const focused=element===document.activeElement?'n/a-submit-handled':(document.activeElement?.tagName||'unknown');return {ok:true,filled:element.value===config.value,value:element.value,key:config.key,focused,events_dispatched:true,form_submitted:formSubmitted,submit_strategy:config.submitStrategy};})()`;
 }
+
+// ─────────────────────────────────────────────
+// wait_any (with tier + timeout diagnosis)
+// ─────────────────────────────────────────────
 
 export function buildWaitAnyExpression(conditions) {
   const sorted = [...conditions].sort((a, b) => (a.tier ?? 0) - (b.tier ?? 0));
   const encoded = JSON.stringify(sorted.map((c) => ({ type: c.type, value: c.value, tier: c.tier ?? 0 })));
   return `(()=>{const conditions=${encoded};let bestTier=null;let best=null;for(let index=0;index<conditions.length;index+=1){const condition=conditions[index];let matched=false;try{if(condition.type==='url_contains')matched=location.href.includes(condition.value);else if(condition.type==='title_contains')matched=document.title.includes(condition.value);else if(condition.type==='selector')matched=Boolean(document.querySelector(condition.value));else if(condition.type==='text')matched=(document.body?.innerText||'').includes(condition.value);}catch{}if(matched){if(bestTier===null||condition.tier<bestTier){bestTier=condition.tier;best={matched:true,index,condition,url:location.href,title:document.title,winner_tier:condition.tier};}}}return best||{matched:false,url:location.href,title:document.title};})()`;
-}
-
-function unwrapEval(data) {
-  if (data && typeof data === "object" && data.value && typeof data.value === "object") return data.value;
-  return data;
 }
 
 export async function executeWaitAny(run, input, options = {}) {
@@ -111,13 +113,16 @@ export async function executeWaitAny(run, input, options = {}) {
 
   const error = new Error(`wait_any timed out after ${timeoutMs}ms`);
   error.lastState = last;
+  error.diagnosis = diagnoseWaitTimeout(last, conditions, timeoutMs);
   throw error;
 }
 
+// ─────────────────────────────────────────────
+// collect (with auto-discover + diagnostics)
+// ─────────────────────────────────────────────
+
 export function buildCollectExpression(input) {
-  if (input.discover) {
-    return buildDiscoverExpression(input);
-  }
+  if (input.discover) return buildDiscoverExpression(input);
 
   const config = {
     selector: input.selector,
@@ -142,9 +147,130 @@ function buildDiscoverExpression(input) {
 export async function executeCollect(run, input, options = {}) {
   if (!input.discover && !input.selector) throw new Error("collect requires selector");
   if (!input.discover && (!Array.isArray(input.fields) || input.fields.length === 0)) throw new Error("collect requires at least one field");
+
+  const timeoutMs = options.timeoutMs ?? input.timeout_ms ?? 10_000;
   const expression = buildCollectExpression(input);
   const args = browserArgs(input.session, "eval", expression);
   appendTab(args, input.tab);
-  const result = await run(args, { timeoutMs: options.timeoutMs ?? input.timeout_ms ?? 10_000 });
-  return { ...result, data: unwrapEval(result.data) };
+  const result = await run(args, { timeoutMs });
+  const data = unwrapEval(result.data);
+
+  // 自动侦察：selector 匹配 0 个时自动 discover
+  if (!input.discover && data && typeof data === "object" && data.total_roots === 0 && input.auto_discover !== false) {
+    const discoverInput = { ...input, discover: true, fields: undefined, required_fields: undefined };
+    const discoverExpr = buildDiscoverExpression(discoverInput);
+    const discoverArgs = browserArgs(input.session, "eval", discoverExpr);
+    appendTab(discoverArgs, input.tab);
+    const discoverResult = await run(discoverArgs, { timeoutMs: Math.min(timeoutMs, 5_000) });
+    const discoverData = unwrapEval(discoverResult.data);
+    return {
+      ...result,
+      data: {
+        ...data,
+        diagnosis: diagnoseCollect(data, input),
+        auto_discover: discoverData,
+      },
+    };
+  }
+
+  // 有结果但全部被过滤
+  if (data && typeof data === "object" && data.total_roots > 0 && data.count === 0) {
+    return {
+      ...result,
+      data: {
+        ...data,
+        diagnosis: diagnoseCollect(data, input),
+      },
+    };
+  }
+
+  return { ...result, data };
+}
+
+// ─────────────────────────────────────────────
+// read — 内容提取（text/html/markdown），支持懒加载自动重试
+// ─────────────────────────────────────────────
+
+export async function executeRead(run, input, options = {}) {
+  const timeoutMs = options.timeoutMs ?? input.timeout_ms ?? 10_000;
+  const session = input.session;
+  const selector = input.selector;
+  const property = input.property ?? "text";
+  const autoRetry = input.auto_scroll_retry !== false;
+
+  const doRead = async (sel) => {
+    const args = browserArgs(session, "get", property);
+    if (sel) args.push(String(sel));
+    appendTab(args, input.tab);
+    const result = await run(args, { timeoutMs });
+    return result;
+  };
+
+  let result = await doRead(selector);
+  let data = result.data;
+
+  // 检查是否为 null/空
+  const isNull = data === null || data === undefined || data === "null";
+  const isEmpty = typeof data === "string" && data.trim() === "" && property === "text";
+
+  if ((isNull || isEmpty) && autoRetry && selector) {
+    // 滚动触发懒加载
+    const scrollArgs = browserArgs(session, "state", "--scroll", "down");
+    appendTab(scrollArgs, input.tab);
+    try {
+      await run(scrollArgs, { timeoutMs: 3_000 });
+    } catch {
+      // 滚动失败不阻塞
+    }
+
+    // 等待元素出现
+    const waitExpr = `Boolean(document.querySelector(${JSON.stringify(selector)}))`;
+    const waitDeadline = performance.now() + Math.min(timeoutMs, 5_000);
+    while (performance.now() < waitDeadline) {
+      await sleep(300);
+      const checkArgs = browserArgs(session, "eval", waitExpr);
+      appendTab(checkArgs, input.tab);
+      try {
+        const checkResult = await run(checkArgs, { timeoutMs: 2_000 });
+        const checkData = unwrapEval(checkResult.data);
+        if (checkData === true) break;
+      } catch {
+        break;
+      }
+    }
+
+    // 重试读取
+    result = await doRead(selector);
+    data = result.data;
+  }
+
+  // 诊断
+  if (data === null || data === undefined || data === "null") {
+    const diagnosis = diagnoseGetNull(data, input);
+    return { ...result, data: { value: null, property, diagnosis } };
+  }
+  if (typeof data === "string" && data.trim() === "" && property === "text") {
+    const diagnosis = diagnoseGetNull(data, input);
+    return { ...result, data: { value: "", property, diagnosis } };
+  }
+
+  return { ...result, data: { value: data, property, chars: typeof data === "string" ? data.length : undefined } };
+}
+
+// ─────────────────────────────────────────────
+// open — 带诊断
+// ─────────────────────────────────────────────
+
+export async function executeOpen(run, input, options = {}) {
+  const timeoutMs = options.timeoutMs ?? input.timeout_ms ?? 15_000;
+  const args = ["open", input.url];
+  if (input.window) args.push("--window", input.window);
+  appendTab(args, input.tab);
+  try {
+    return await run(args, { timeoutMs });
+  } catch (error) {
+    const diagnosis = diagnoseOpen(error, input.url);
+    const wrapped = Object.assign(new Error(error.message), { details: error.details, diagnosis });
+    throw wrapped;
+  }
 }

@@ -55,7 +55,8 @@ test("fill_submit uses one atomic DOM event command for CSS targets", async () =
 test("fill_submit event strategy skips form.submit", () => {
   const expr = buildFillSubmitExpression({ target: "#kw", value: "test", key: "Enter", submit_strategy: "event" });
   assert.match(expr, /submit_strategy/);
-  assert.match(expr, /config\.submitStrategy==='event'/);
+  assert.match(expr, /submitStrategy.*event/);
+  assert.match(expr, /shouldSubmit.*form.*both/);
 });
 
 test("fill_submit both strategy dispatches events then form.submit", () => {

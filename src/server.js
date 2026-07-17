@@ -2,7 +2,7 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
 import { createOpenCliRunner, OpenCliError } from "./opencli-runner.js";
-import { executeCollect, executeFillSubmit, executeWaitAny } from "./browser-advanced.js";
+import { executeCollect, executeFillSubmit, executeWaitAny, executeOpen, executeRead } from "./browser-advanced.js";
 import {
   buildSnapshotArgsForAction,
   buildWaitArgsForAction,
@@ -114,6 +114,7 @@ const flowStepSchema = z.object({
     text_contains: z.array(z.string()).optional(),
   })]).optional(),
   submit_strategy: z.enum(["form", "event", "both"]).optional(),
+  auto_scroll_retry: z.union([z.boolean(), z.string()]).optional(),
   property: z.enum(["title", "url", "text", "value", "attributes", "html"]).optional(),
   selector: z.string().optional(),
   fields: z.array(collectFieldSchema).min(1).max(20).optional(),
@@ -334,32 +335,42 @@ export function createServer(options = {}) {
   server.registerTool(
     "browser_get",
     {
-      description: "Read title, URL, element text/value/attributes, or bounded page HTML/JSON tree.",
+      description: "Read page state: title, URL, input value, or element attributes. For content extraction (text/html), use browser_read instead.",
       inputSchema: {
-        property: z.enum(["title", "url", "text", "value", "attributes", "html"]),
+        property: z.enum(["title", "url", "value", "attributes"]),
         session: sessionSchema,
         target: targetSchema,
         selector: z.string().optional(),
-        as: z.enum(["html", "json"]).optional(),
-        depth: z.number().int().positive().optional(),
-        children_max: z.number().int().positive().optional(),
-        text_max: z.number().int().positive().optional(),
         ...locatorFields,
         tab: tabSchema,
       },
     },
     wrap(async (input) => {
       const args = browserArgs(input.session, "get", input.property);
-      const positionalTarget = input.target ?? (input.property !== "html" ? input.selector : undefined);
-      if (positionalTarget !== undefined && input.property !== "html") args.push(String(positionalTarget));
-      if (input.property === "html") appendOption(args, "--selector", input.selector);
-      appendOption(args, "--as", input.as);
-      appendOption(args, "--depth", input.depth);
-      appendOption(args, "--children-max", input.children_max);
-      appendOption(args, "--text-max", input.text_max);
+      const positionalTarget = input.target ?? input.selector;
+      if (positionalTarget !== undefined) args.push(String(positionalTarget));
       appendLocator(args, input);
       appendTab(args, input.tab);
       return successResult(await run(args));
+    }),
+  );
+
+  server.registerTool(
+    "browser_read",
+    {
+      description: "Extract content from the page: text, html, or markdown. Supports auto-scroll retry for lazily-loaded elements. Returns diagnosis on failure.",
+      inputSchema: {
+        property: z.enum(["text", "html"]).default("text"),
+        session: sessionSchema,
+        selector: z.string().optional().describe("CSS selector for the target element. If omitted, reads entire page."),
+        auto_scroll_retry: z.union([z.boolean(), z.string()]).default(true).describe("If element not found, auto-scroll and retry once."),
+        timeout_ms: z.number().int().positive().max(60_000).default(10_000),
+        tab: tabSchema,
+      },
+    },
+    wrap(async (input) => {
+      input.auto_scroll_retry = input.auto_scroll_retry === true || input.auto_scroll_retry === "true";
+      return successResult(await executeRead(run, { ...input, session: normalizeSession(input.session) }));
     }),
   );
 
