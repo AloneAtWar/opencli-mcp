@@ -39,13 +39,24 @@ export function compactSnapshotData(data, options = {}) {
 
   let value = kept.join("\n").replace(/\n{4,}/g, "\n\n\n");
   let truncated = false;
+  let middleOmittedChars = 0;
   if (value.length > maxChars) {
-    value = value.slice(0, maxChars).replace(/\n[^\n]*$/, "");
     truncated = true;
+    const markerReserve = 180;
+    const payloadBudget = Math.max(1, maxChars - markerReserve);
+    const headBudget = Math.floor(payloadBudget * 0.35);
+    const tailBudget = payloadBudget - headBudget;
+    let head = value.slice(0, headBudget).replace(/\n[^\n]*$/, "");
+    let tail = value.slice(-tailBudget).replace(/^[^\n]*\n/, "");
+    middleOmittedChars = Math.max(0, value.length - head.length - tail.length);
+    const marker = `\n---\n[compact snapshot: omitted ${middleOmittedChars} middle char(s); head and tail preserved]\n---\n`;
+    value = `${head}${marker}${tail}`;
+    if (value.length > maxChars) value = value.slice(0, maxChars);
   }
   const omittedChars = Math.max(0, data.length - value.length);
-  if (omittedLines > 0 || truncated) {
-    value += `\n---\n[compact snapshot: omitted ${omittedLines} line(s), ${omittedChars} char(s); request a larger limit or full browser_snapshot if needed]`;
+  if (omittedLines > 0 && !truncated) {
+    const marker = `\n---\n[compact snapshot: omitted ${omittedLines} line(s), ${omittedChars} char(s); request a larger limit or full browser_snapshot if needed]`;
+    value = `${value.slice(0, Math.max(0, maxChars - marker.length))}${marker}`;
   }
   return {
     value,
@@ -70,6 +81,18 @@ export function paginateNetworkData(data, options = {}) {
     returned: entries.length,
     offset,
     next_offset: offset + entries.length < total ? offset + entries.length : null,
+  };
+}
+
+export function selectFindNth(data, nth) {
+  if (nth === undefined || nth === null) return data;
+  if (!data || typeof data !== "object" || !Array.isArray(data.entries)) return data;
+  const selected = data.entries[nth];
+  return {
+    ...data,
+    entries: selected ? [selected] : [],
+    original_matches: data.entries.length,
+    selected_nth: nth,
   };
 }
 
@@ -102,7 +125,7 @@ function buildWaitArgs(step, session) {
 function buildFindArgs(step, session) {
   const args = browserArgs(session, "find");
   appendOption(args, "--css", step.css);
-  appendLocator(args, step);
+  appendLocator(args, { ...step, nth: undefined });
   appendOption(args, "--limit", step.limit ?? 50);
   appendOption(args, "--text-max", step.text_max ?? 120);
   appendTab(args, step.tab);
@@ -207,6 +230,9 @@ async function executeStep(run, step, session, variables, timeoutMs) {
       throw new Error(`Unsupported browser_flow operation: ${step.operation}`);
   }
   const result = await run(args, { timeoutMs });
+  if (step.operation === "find") {
+    result.data = selectFindNth(result.data, step.nth);
+  }
   if (step.operation === "wait") {
     result.data = normalizeWaitData(result.data, step.type, step.value);
   }

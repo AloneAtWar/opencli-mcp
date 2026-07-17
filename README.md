@@ -159,7 +159,7 @@ agent:
 | `browser_open` | 打开 URL，支持前台/后台窗口 |
 | `browser_bind` | 绑定/解绑用户当前 Chrome 标签页 |
 | `browser_snapshot` | 完整 DOM 或 AX 快照和 refs |
-| `browser_snapshot_compact` | 未知/嘈杂网站的限长快照；保留 refs，并明确报告省略内容 |
+| `browser_snapshot_compact` | 未知/嘈杂网站的限长快照；保留头尾与 refs，并明确报告被省略的中间内容 |
 | `browser_find` | CSS/role/name/label/text/testid 查询 |
 | `browser_get` | title/url/text/value/attributes/html |
 | `browser_extract` | Markdown 长文分块提取 |
@@ -200,7 +200,8 @@ match_level: exact | stable | reidentified
 - `retry` 只能为 0 或 1；
 - 必需步骤失败立即停止并返回 partial trace；
 - `optional=true` 的步骤失败后标记 skipped；
-- `find + save_as` 可保存唯一 ref，后续用 `$变量名` 引用。
+- `find + save_as` 可保存唯一 ref，后续用 `$变量名` 引用；
+- 当前 OpenCLI `find` 不接受 `--nth`，MCP 会先获取候选，再在本地选择第 N 项。
 
 示例：
 

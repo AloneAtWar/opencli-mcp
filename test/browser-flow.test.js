@@ -5,6 +5,7 @@ import {
   executeBrowserFlow,
   normalizeWaitData,
   paginateNetworkData,
+  selectFindNth,
 } from "../src/browser-flow.js";
 
 test("compacts noisy snapshots with explicit omission metadata", () => {
@@ -20,6 +21,23 @@ test("compacts noisy snapshots with explicit omission metadata", () => {
   assert.doesNotMatch(result.value, /page_css/);
   assert.match(result.value, /Continue/);
   assert.match(result.value, /compact snapshot/);
+});
+
+test("preserves both head and tail when compacting a long snapshot", () => {
+  const raw = `URL: https://example.com\n${"middle-noise\n".repeat(200)}[99]<button>TARGET_AT_END</button>`;
+  const result = compactSnapshotData(raw, { maxChars: 800, maxLines: 500 });
+  assert.equal(result.compacted, true);
+  assert.ok(result.value.length <= 800);
+  assert.match(result.value, /URL: https:\/\/example.com/);
+  assert.match(result.value, /TARGET_AT_END/);
+  assert.match(result.value, /head and tail preserved/);
+});
+
+test("selects nth find result in the MCP layer", () => {
+  const selected = selectFindNth({ entries: [{ ref: 3 }, { ref: 7 }] }, 1);
+  assert.deepEqual(selected.entries, [{ ref: 7 }]);
+  assert.equal(selected.original_matches, 2);
+  assert.equal(selected.selected_nth, 1);
 });
 
 test("normalizes OpenCLI time-wait output to milliseconds", () => {

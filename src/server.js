@@ -9,6 +9,7 @@ import {
   executeBrowserFlow,
   normalizeWaitData,
   paginateNetworkData,
+  selectFindNth,
 } from "./browser-flow.js";
 import {
   appendFlag,
@@ -281,11 +282,13 @@ export function createServer(options = {}) {
     wrap(async (input) => {
       const args = browserArgs(input.session, "find");
       appendOption(args, "--css", input.css);
-      appendLocator(args, input);
+      appendLocator(args, { ...input, nth: undefined });
       appendOption(args, "--limit", input.limit);
       appendOption(args, "--text-max", input.text_max);
       appendTab(args, input.tab);
-      return successResult(await run(args));
+      const result = await run(args);
+      result.data = selectFindNth(result.data, input.nth);
+      return successResult(result);
     }),
   );
 
