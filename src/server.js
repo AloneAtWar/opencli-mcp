@@ -196,12 +196,44 @@ export function createServer(options = {}) {
   );
 
   server.registerTool(
-    "opencli_list",
+    "opencli_adapter_list",
     {
-      description: "List installed OpenCLI site adapters and commands. Prefer an adapter before raw browser driving.",
-      inputSchema: {},
+      description: "Search installed OpenCLI adapters by keyword(s). Matches against site, command, name, description, and domain. Returns filtered results with full metadata — much faster than opencli_list for targeted lookups.",
+      inputSchema: {
+        keywords: z.array(z.string()).optional().describe("Keywords to filter adapters. All keywords must match (AND logic). Each keyword is checked against site, name, command, description, and domain (case-insensitive). Omit to return all adapters."),
+        limit: z.number().int().positive().max(500).default(50).describe("Maximum number of adapters to return."),
+      },
     },
-    wrap(async () => successResult(await run(["list", "-f", "json"]))),
+    wrap(async ({ keywords, limit }) => {
+      const result = await run(["list", "-f", "json"]);
+      let adapters = result.data;
+      if (!Array.isArray(adapters)) {
+        return successResult(result);
+      }
+      if (Array.isArray(keywords) && keywords.length > 0) {
+        const normalized = keywords.map((kw) => kw.toLowerCase());
+        adapters = adapters.filter((adapter) => {
+          const haystack = [
+            adapter.site,
+            adapter.name,
+            adapter.command,
+            adapter.description,
+            adapter.domain,
+          ]
+            .filter(Boolean)
+            .join(" ")
+            .toLowerCase();
+          return normalized.every((kw) => haystack.includes(kw));
+        });
+      }
+      if (adapters.length > limit) {
+        adapters = adapters.slice(0, limit);
+      }
+      return {
+        content: [{ type: "text", text: asJsonText(adapters) }],
+        structuredContent: { value: adapters, total: adapters.length },
+      };
+    }),
   );
 
   server.registerTool(
