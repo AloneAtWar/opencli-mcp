@@ -19,7 +19,7 @@ try {
       steps: [
         { id: "open", operation: "open", url: "https://example.com", window: "background", timeout_ms: 10000 },
         { id: "find", operation: "find", role: "link", name: "Learn more", limit: 5, save_as: "more", timeout_ms: 5000 },
-        { id: "click", operation: "action", action: "click", target: "$more", timeout_ms: 5000 },
+        { id: "click", operation: "action", action: "click", target: "$more", timeout_ms: 15000 },
         { id: "wait", operation: "wait", type: "text", value: "IANA-managed Reserved Domains", timeout_ms: 15000 },
         { id: "title", operation: "get", property: "title", timeout_ms: 5000 },
         { id: "snapshot", operation: "snapshot", compact: true, max_chars: 6000, timeout_ms: 5000 },

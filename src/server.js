@@ -1,7 +1,12 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { createOpenCliRunner, OpenCliError } from "./opencli-runner.js";
+import {
+  createOpenCliRunner,
+  describeOpenCliCandidates,
+  OpenCliError,
+  resolveOpenCli,
+} from "./opencli-runner.js";
 import { executeCollect, executeFillSubmit, executeWaitAny, executeOpen, executeRead } from "./browser-advanced.js";
 import {
   buildSnapshotArgsForAction,
@@ -80,7 +85,7 @@ const flowStepSchema = z.object({
   save_as: z.string().regex(/^[A-Za-z_][A-Za-z0-9_]{0,63}$/).optional(),
   tab: tabSchema,
   url: z.string().optional(),
-  window: z.enum(["foreground", "background"]).optional(),
+  window: z.enum(["foreground", "background"]).default("background"),
   action: z.enum(["click", "hover", "focus", "dblclick", "check", "uncheck", "type", "fill", "select", "keys", "scroll", "upload", "drag"]).optional(),
   target: z.union([z.string(), z.number()]).optional(),
   value: z.string().optional(),
@@ -167,6 +172,29 @@ function errorResult(error) {
   };
 }
 
+// P2 observability: report which discovery path resolved the OpenCLI CLI. Never throws, so a
+// resolution failure degrades to extra diagnostics instead of breaking the tool call.
+function resolutionExtra(env) {
+  try {
+    const resolved = resolveOpenCli(env);
+    return {
+      resolution: {
+        command: resolved.command,
+        prefixArgs: resolved.prefixArgs,
+        source: resolved.source,
+      },
+    };
+  } catch (error) {
+    const extra = { resolutionError: error.message };
+    try {
+      extra.resolutionCandidates = describeOpenCliCandidates(env);
+    } catch {
+      // Candidate probing is best-effort diagnostics only.
+    }
+    return extra;
+  }
+}
+
 function wrap(handler) {
   return async (input) => {
     try {
@@ -191,14 +219,21 @@ export function createServer(options = {}) {
     },
     wrap(async ({ doctor }) => {
       const args = doctor ? ["doctor"] : ["--version"];
-      return successResult(await run(args, { timeoutMs: doctor ? 120_000 : 30_000 }));
+      const extra = resolutionExtra(options.runnerOptions?.env ?? process.env);
+      try {
+        return successResult(await run(args, { timeoutMs: doctor ? 120_000 : 30_000 }), extra);
+      } catch (error) {
+        const failure = errorResult(error);
+        failure.structuredContent = { ...failure.structuredContent, ...extra };
+        return failure;
+      }
     }),
   );
 
   server.registerTool(
     "opencli_adapter_list",
     {
-      description: "Search installed OpenCLI adapters by keyword(s). Matches against site, command, name, description, and domain. Returns filtered results with full metadata — much faster than opencli_list for targeted lookups.",
+      description: "Search installed OpenCLI adapters by keyword(s). Matches against site, command, name, description, and domain. Returns filtered results with full metadata, without returning the full adapter list for targeted lookups.",
       inputSchema: {
         keywords: z.array(z.string()).optional().describe("Keywords to filter adapters. All keywords must match (AND logic). Each keyword is checked against site, name, command, description, and domain (case-insensitive). Omit to return all adapters."),
         limit: z.number().int().positive().max(500).default(50).describe("Maximum number of adapters to return."),
@@ -262,7 +297,7 @@ export function createServer(options = {}) {
       inputSchema: {
         url: z.string().url(),
         session: sessionSchema,
-        window: z.enum(["foreground", "background"]).optional(),
+        window: z.enum(["foreground", "background"]).default("background"),
         tab: tabSchema,
       },
     },
@@ -390,11 +425,13 @@ export function createServer(options = {}) {
   server.registerTool(
     "browser_read",
     {
-      description: "Extract content from the page: text, html, or markdown. Supports auto-scroll retry for lazily-loaded elements. Returns diagnosis on failure.",
+      description: "Extract content from the page as text | html. The target may be a numeric ref from browser_snapshot/browser_find or a CSS selector. For long-form page content or Markdown, use browser_extract instead. Supports auto-scroll retry for lazily-loaded elements. Returns diagnosis on failure.",
       inputSchema: {
         property: z.enum(["text", "html"]).default("text"),
         session: sessionSchema,
-        selector: z.string().optional().describe("CSS selector for the target element. If omitted, reads entire page."),
+        target: targetSchema,
+        selector: z.string().optional().describe("CSS selector for the target element. Alias for target; if both are omitted, reads the entire page."),
+        nth: z.number().int().nonnegative().optional(),
         auto_scroll_retry: z.union([z.boolean(), z.string()]).default(true).describe("If element not found, auto-scroll and retry once."),
         timeout_ms: z.number().int().positive().max(60_000).default(10_000),
         tab: tabSchema,
@@ -810,5 +847,85 @@ export async function startServer(options = {}) {
   const server = createServer(options);
   const transport = new StdioServerTransport();
   await server.connect(transport);
+  startPreflight(options);
   return server;
+}
+
+const PREFLIGHT_TIMEOUT_MS = 20_000;
+
+// P2 startup self-check: resolve the CLI and probe `--version` once so a broken discovery path is
+// visible in the host logs before the first tool call. Fire-and-forget: it never blocks the MCP
+// handshake, never writes to stdout (stdout carries MCP frames), and never throws.
+function startPreflight(options) {
+  if (options.preflight === false || process.env.OPENCLI_MCP_SKIP_PREFLIGHT === "1") return;
+
+  void (async () => {
+    const env = options.runnerOptions?.env ?? process.env;
+    let resolved;
+    try {
+      resolved = resolveOpenCli(env);
+    } catch (error) {
+      process.stderr.write(
+        `[opencli-mcp] preflight failed: ${error.message} | fix: set OPENCLI_MCP_BIN to the OpenCLI ` +
+          `executable (plus OPENCLI_MCP_PREFIX_ARGS when needed), or install OpenCLIApp` +
+          `${describeCandidatesSuffix(env)}\n`,
+      );
+      return;
+    }
+
+    const invocation = `${resolved.command} ${resolved.prefixArgs.join(" ")}`.trim();
+    try {
+      const run = options.runOpenCli ?? createOpenCliRunner(options.runnerOptions);
+      const result = await withTimeout(
+        run(["--version"], { timeoutMs: PREFLIGHT_TIMEOUT_MS }),
+        PREFLIGHT_TIMEOUT_MS,
+      );
+      process.stderr.write(
+        `[opencli-mcp] preflight ok: ${describeVersion(result)} | command: ${invocation} | source: ${resolved.source}\n`,
+      );
+    } catch (error) {
+      process.stderr.write(
+        `[opencli-mcp] preflight failed: ${error.message} | command: ${invocation} | source: ${resolved.source} | ` +
+          `fix: verify the OpenCLI install, or set OPENCLI_MCP_BIN (plus OPENCLI_MCP_PREFIX_ARGS) to a working executable\n`,
+      );
+    }
+  })();
+}
+
+function describeVersion(result) {
+  const raw = typeof result?.stdout === "string" ? result.stdout : "";
+  const line = raw.split(/\r?\n/).map((part) => part.trim()).find(Boolean);
+  if (line) return line;
+  if (result?.data != null) return asJsonText(result.data);
+  return "(no version output)";
+}
+
+function describeCandidatesSuffix(env) {
+  try {
+    const candidates = describeOpenCliCandidates(env);
+    if (Array.isArray(candidates) && candidates.length > 0) {
+      const labels = candidates
+        .map((candidate) => (typeof candidate === "string" ? candidate : candidate?.source ?? candidate?.command))
+        .filter(Boolean);
+      if (labels.length > 0) return ` | probed: ${labels.join(", ")}`;
+    }
+  } catch {
+    // Candidate probing is best-effort diagnostics only.
+  }
+  return "";
+}
+
+async function withTimeout(promise, timeoutMs) {
+  let timer;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`preflight timed out after ${timeoutMs}ms`)), timeoutMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
 }

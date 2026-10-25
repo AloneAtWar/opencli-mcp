@@ -6,15 +6,130 @@ import {
   buildWaitAnyExpression,
   executeCollect,
   executeFillSubmit,
+  executeOpen,
+  executeRead,
   executeWaitAny,
+  isRefTarget,
+  refTargetToSelector,
 } from "../src/browser-advanced.js";
+
+// --- open ---
+
+test("executeOpen builds a browser-prefixed open command", async () => {
+  let args;
+  const run = async (received) => {
+    args = received;
+    return { data: { url: "https://example.com" } };
+  };
+  await executeOpen(run, { session: "open-test", url: "https://example.com", window: "background" });
+  assert.deepEqual(args, ["browser", "open-test", "open", "https://example.com", "--window", "background"]);
+});
+
+test("executeOpen omits --window when not provided", async () => {
+  let args;
+  const run = async (received) => {
+    args = received;
+    return { data: { url: "https://example.com" } };
+  };
+  await executeOpen(run, { session: "open-test", url: "https://example.com" });
+  assert.deepEqual(args, ["browser", "open-test", "open", "https://example.com"]);
+});
+
+// --- read ---
+
+test("executeRead scopes html with --selector instead of a positional target", async () => {
+  let args;
+  const run = async (received) => {
+    args = received;
+    return { data: "<a>hi</a>" };
+  };
+  const result = await executeRead(run, { session: "read-test", selector: "a", property: "html" });
+  assert.deepEqual(args, ["browser", "read-test", "get", "html", "--selector", "a"]);
+  assert.equal(result.data.property, "html");
+});
+
+test("executeRead keeps a positional target for text", async () => {
+  let args;
+  const run = async (received) => {
+    args = received;
+    return { data: "Learn more" };
+  };
+  await executeRead(run, { session: "read-test", selector: "a", property: "text" });
+  assert.deepEqual(args, ["browser", "read-test", "get", "text", "a"]);
+});
+
+test("executeRead accepts the target alias and forwards nth", async () => {
+  let args;
+  const run = async (received) => {
+    args = received;
+    return { data: { value: "second", matches_n: 6, match_level: "exact" } };
+  };
+  const result = await executeRead(run, { session: "read-test", target: 2, property: "text", nth: 1 });
+  assert.deepEqual(args, ["browser", "read-test", "get", "text", "2", "--nth", "1"]);
+  assert.equal(result.data.value, "second");
+  assert.equal(result.data.nth, 1);
+  assert.equal(result.data.matches_n, 6);
+  assert.equal(result.data.ambiguous_selector, undefined);
+});
+
+test("executeRead maps an html numeric ref to a data-opencli-ref selector", async () => {
+  let args;
+  const run = async (received) => {
+    args = received;
+    return { data: "<a>hi</a>" };
+  };
+  const result = await executeRead(run, { session: "read-test", target: 1, property: "html" });
+  assert.deepEqual(args, ["browser", "read-test", "get", "html", "--selector", '[data-opencli-ref="1"]']);
+  assert.equal(result.data.property, "html");
+  assert.equal(result.data.value, "<a>hi</a>");
+  assert.equal(result.data.matches_n, undefined);
+});
+
+test("executeRead ignores nth for html and notes it", async () => {
+  let args;
+  const run = async (received) => {
+    args = received;
+    return { data: "<div>hi</div>" };
+  };
+  const result = await executeRead(run, { session: "read-test", selector: "#x", property: "html", nth: 2 });
+  assert.deepEqual(args, ["browser", "read-test", "get", "html", "--selector", "#x"]);
+  assert.equal(result.data.nth_ignored, true);
+  assert.match(result.data.note, /nth/);
+  assert.equal(result.data.matches_n, undefined);
+});
+
+test("executeRead flags ambiguity when a selector matches multiple elements", async () => {
+  const run = async () => ({ data: { value: "First", matches_n: 6, match_level: "exact" } });
+  const result = await executeRead(run, { session: "read-test", selector: "p", property: "text" });
+  assert.equal(result.data.value, "First");
+  assert.equal(result.data.ambiguous_selector, true);
+  assert.equal(result.data.matches_n, 6);
+  assert.match(result.data.hint, /nth/);
+});
+
+// --- ref helpers ---
+
+test("isRefTarget and refTargetToSelector map refs to data-opencli-ref selectors", () => {
+  assert.equal(isRefTarget(1), true);
+  assert.equal(isRefTarget("2"), true);
+  assert.equal(isRefTarget(" 3 "), true);
+  assert.equal(isRefTarget("#id"), false);
+  assert.equal(isRefTarget("a"), false);
+  assert.equal(isRefTarget(undefined), false);
+  assert.equal(isRefTarget(null), false);
+  assert.equal(refTargetToSelector(1), '[data-opencli-ref="1"]');
+  assert.equal(refTargetToSelector("42"), '[data-opencli-ref="42"]');
+});
 
 // --- fill_submit ---
 
-test("fill_submit fallback runs fill, focus, and key press in one bounded call", async () => {
+test("fill_submit fallback verifies navigation around fill, focus, and key press", async () => {
   const calls = [];
+  let url = "https://example.com/";
   const run = async (args) => {
     calls.push(args);
+    if (args[2] === "get" && args[3] === "url") return { data: url };
+    if (args[2] === "keys") url = "https://example.com/results";
     return { data: { ok: true, command: args[2] } };
   };
   const result = await executeFillSubmit(run, {
@@ -26,12 +141,45 @@ test("fill_submit fallback runs fill, focus, and key press in one bounded call",
     timeout_ms: 5000,
   });
   assert.deepEqual(calls, [
+    ["browser", "submit-test", "get", "url"],
     ["browser", "submit-test", "fill", "#search", "agent浏览器"],
     ["browser", "submit-test", "focus", "#search"],
     ["browser", "submit-test", "keys", "Enter"],
+    ["browser", "submit-test", "get", "url"],
   ]);
   assert.equal(result.data.key, "Enter");
   assert.equal(result.data.mode, "cli-fallback");
+  assert.equal(result.data.atomic_skipped, true);
+  assert.equal(result.data.focus_ok, true);
+  assert.equal(result.data.submit_verified, true);
+  assert.equal(result.data.url_before, "https://example.com/");
+  assert.equal(result.data.url_after, "https://example.com/results");
+  assert.deepEqual(result.data.warnings, []);
+});
+
+test("fill_submit fallback skips url verification when verify_navigation is false", async () => {
+  const calls = [];
+  const run = async (args) => {
+    calls.push(args);
+    return { data: { focused: false } };
+  };
+  const result = await executeFillSubmit(run, {
+    session: "submit-test",
+    target: "#search",
+    value: "x",
+    atomic: false,
+    verify_navigation: false,
+  });
+  assert.deepEqual(calls, [
+    ["browser", "submit-test", "fill", "#search", "x"],
+    ["browser", "submit-test", "focus", "#search"],
+    ["browser", "submit-test", "keys", "Enter"],
+  ]);
+  assert.equal(result.data.mode, "cli-fallback");
+  assert.equal(result.data.atomic_skipped, true);
+  assert.equal(result.data.focus_ok, false);
+  assert.equal(result.data.submit_verified, null);
+  assert.deepEqual(result.data.warnings, ["focus_failed"]);
 });
 
 test("fill_submit uses one atomic DOM event command for CSS targets", async () => {
@@ -50,6 +198,50 @@ test("fill_submit uses one atomic DOM event command for CSS targets", async () =
   assert.equal(calls.length, 1);
   assert.deepEqual(calls[0].slice(0, 3), ["browser", "atomic-submit", "eval"]);
   assert.equal(result.data.mode, "atomic-dom-event");
+});
+
+test("fill_submit uses the atomic DOM path for a numeric ref target", async () => {
+  const calls = [];
+  const run = async (args) => {
+    calls.push(args);
+    return { data: { ok: true, filled: true, focused: true, events_dispatched: true } };
+  };
+  const result = await executeFillSubmit(run, {
+    session: "atomic-ref",
+    target: 1,
+    value: "OpenCLI",
+    key: "Enter",
+    timeout_ms: 5000,
+  });
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].slice(0, 3), ["browser", "atomic-ref", "eval"]);
+  assert.match(calls[0][3], /\[data-opencli-ref=\\"1\\"\]/);
+  assert.equal(result.data.mode, "atomic-dom-event");
+});
+
+test("fill_submit falls back to the CLI path when a numeric ref is stale", async () => {
+  const calls = [];
+  const run = async (args) => {
+    calls.push(args);
+    if (args[2] === "eval") return { data: { ok: false, error: "target_not_found" } };
+    return { data: { focused: true } };
+  };
+  const result = await executeFillSubmit(run, {
+    session: "ref-stale",
+    target: 1,
+    value: "x",
+    verify_navigation: false,
+    timeout_ms: 5000,
+  });
+  assert.deepEqual(calls[0].slice(0, 3), ["browser", "ref-stale", "eval"]);
+  assert.deepEqual(calls.slice(1), [
+    ["browser", "ref-stale", "fill", "1", "x"],
+    ["browser", "ref-stale", "focus", "1"],
+    ["browser", "ref-stale", "keys", "Enter"],
+  ]);
+  assert.equal(result.data.mode, "cli-fallback");
+  assert.equal(result.data.atomic_skipped, true);
+  assert.equal(result.data.atomic_error, "target_not_found");
 });
 
 test("fill_submit event strategy skips form.submit", () => {

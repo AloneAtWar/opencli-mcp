@@ -1,5 +1,5 @@
 import { performance } from "node:perf_hooks";
-import { appendTab, browserArgs, buildActionArgs } from "./commands.js";
+import { appendOption, appendTab, browserArgs, buildActionArgs } from "./commands.js";
 import {
   diagnoseCollect,
   diagnoseFillSubmit,
@@ -20,6 +20,19 @@ function unwrapEval(data) {
   return data;
 }
 
+// OpenCLI materializes every allocated snapshot/find ref in the live DOM as the
+// attribute `data-opencli-ref`, so a numeric ref can be expressed as CSS.
+export function isRefTarget(target) {
+  if (typeof target === "number") return Number.isInteger(target);
+  if (typeof target === "string") return /^\d+$/.test(target.trim());
+  return false;
+}
+
+export function refTargetToSelector(target) {
+  const ref = typeof target === "number" ? target : String(target).trim();
+  return `[data-opencli-ref="${ref}"]`;
+}
+
 // ─────────────────────────────────────────────
 // fill_submit
 // ─────────────────────────────────────────────
@@ -30,18 +43,27 @@ export async function executeFillSubmit(run, input, options = {}) {
   const session = input.session;
   const key = input.key ?? "Enter";
   const submitStrategy = input.submit_strategy ?? "form";
+  const refTarget = isRefTarget(input.target);
+  const atomicTarget = refTarget ? refTargetToSelector(input.target) : input.target;
 
-  if (typeof input.target === "string" && input.atomic !== false) {
-    const expression = buildFillSubmitExpression({ ...input, key, submit_strategy: submitStrategy });
+  let atomicError = null;
+  if (atomicTarget !== undefined && atomicTarget !== null && input.atomic !== false) {
+    const expression = buildFillSubmitExpression({ ...input, target: atomicTarget, key, submit_strategy: submitStrategy });
     const args = browserArgs(session, "eval", expression);
     appendTab(args, input.tab);
     const result = await run(args, { timeoutMs });
     const data = unwrapEval(result.data);
-    if (!data?.ok) {
+    if (data?.ok) {
+      return { ...result, data: { ...data, mode: "atomic-dom-event" } };
+    }
+    // A stale numeric ref (its data-opencli-ref attribute is gone) can still be
+    // submitted through the CLI path; a bad CSS selector is a hard failure.
+    if (refTarget && data?.error === "target_not_found") {
+      atomicError = data.error;
+    } else {
       const diagnosis = diagnoseFillSubmit(data, input);
       throw Object.assign(new Error(`fill_submit failed: ${data?.error || "unknown DOM error"}`), { diagnosis });
     }
-    return { ...result, data: { ...data, mode: "atomic-dom-event" } };
   }
 
   const shared = {
@@ -56,11 +78,48 @@ export async function executeFillSubmit(run, input, options = {}) {
     tab: input.tab,
   };
 
+  const verifyNavigation = input.verify_navigation !== false;
+  const readUrl = async () => {
+    try {
+      const result = await run(browserArgs(session, "get", "url"), { timeoutMs: remainingMs(deadline, timeoutMs) });
+      const data = result.data;
+      if (typeof data === "string") return data;
+      return data?.value ?? data?.url ?? null;
+    } catch {
+      return null;
+    }
+  };
+
+  const urlBefore = verifyNavigation ? await readUrl() : null;
   const fill = await run(buildActionArgs({ ...shared, action: "fill", value: input.value }), { timeoutMs: remainingMs(deadline, timeoutMs) });
   const focus = await run(buildActionArgs({ ...shared, action: "focus" }), { timeoutMs: remainingMs(deadline, timeoutMs) });
   const keys = await run(buildActionArgs({ session, action: "keys", key, tab: input.tab }), { timeoutMs: remainingMs(deadline, timeoutMs) });
+  const urlAfter = verifyNavigation ? await readUrl() : null;
 
-  return { data: { filled: fill.data, focused: focus.data, submitted: keys.data, key, mode: "cli-fallback" } };
+  const focusOk = focus?.data?.focused !== false;
+  const warnings = [];
+  if (!focusOk) warnings.push("focus_failed");
+  let submitVerified = null;
+  if (verifyNavigation) {
+    submitVerified = Boolean(urlBefore) && Boolean(urlAfter) && urlBefore !== urlAfter;
+    if (!submitVerified) warnings.push("submit_not_verified");
+  }
+
+  const data = {
+    filled: fill.data,
+    focused: focus.data,
+    submitted: keys.data,
+    key,
+    mode: "cli-fallback",
+    atomic_skipped: true,
+    focus_ok: focusOk,
+    submit_verified: submitVerified,
+    url_before: urlBefore,
+    url_after: urlAfter,
+    warnings,
+  };
+  if (atomicError) data.atomic_error = atomicError;
+  return { data };
 }
 
 export function buildFillSubmitExpression(input) {
@@ -194,26 +253,47 @@ export async function executeCollect(run, input, options = {}) {
 export async function executeRead(run, input, options = {}) {
   const timeoutMs = options.timeoutMs ?? input.timeout_ms ?? 10_000;
   const session = input.session;
-  const selector = input.selector;
+  // Sibling tools (`browser_get`/`browser_find`/`browser_action`) use `target`;
+  // `browser_read` historically used `selector`. Accept both.
+  const target = input.target ?? input.selector;
   const property = input.property ?? "text";
   const autoRetry = input.auto_scroll_retry !== false;
+  const nth = input.nth;
+  const isHtml = property === "html";
+  // `get html` takes no positional target and no --nth; it scopes by --selector.
+  // A numeric ref maps to its materialized DOM attribute.
+  const targetCss = isRefTarget(target) ? refTargetToSelector(target) : target;
 
-  const doRead = async (sel) => {
+  const doRead = async () => {
     const args = browserArgs(session, "get", property);
-    if (sel) args.push(String(sel));
+    if (isHtml) {
+      appendOption(args, "--selector", targetCss);
+    } else {
+      if (target !== undefined && target !== null && target !== "") args.push(String(target));
+      if (nth !== undefined) appendOption(args, "--nth", nth);
+    }
     appendTab(args, input.tab);
-    const result = await run(args, { timeoutMs });
-    return result;
+    return await run(args, { timeoutMs });
   };
 
-  let result = await doRead(selector);
-  let data = result.data;
+  // text/value/attributes emit a `{value, matches_n, match_level}` envelope;
+  // html emits a raw string with no envelope.
+  const unwrapGet = (result) => {
+    const data = result.data;
+    if (!isHtml && data && typeof data === "object" && !Array.isArray(data) && "value" in data) {
+      return { value: data.value, matchesN: data.matches_n };
+    }
+    return { value: data, matchesN: undefined };
+  };
+
+  let result = await doRead();
+  let { value, matchesN } = unwrapGet(result);
 
   // 检查是否为 null/空
-  const isNull = data === null || data === undefined || data === "null";
-  const isEmpty = typeof data === "string" && data.trim() === "" && property === "text";
+  const isNull = value === null || value === undefined || value === "null";
+  const isEmpty = typeof value === "string" && value.trim() === "" && property === "text";
 
-  if ((isNull || isEmpty) && autoRetry && selector) {
+  if ((isNull || isEmpty) && autoRetry && targetCss) {
     // 滚动触发懒加载
     const scrollArgs = browserArgs(session, "state", "--scroll", "down");
     appendTab(scrollArgs, input.tab);
@@ -224,7 +304,7 @@ export async function executeRead(run, input, options = {}) {
     }
 
     // 等待元素出现
-    const waitExpr = `Boolean(document.querySelector(${JSON.stringify(selector)}))`;
+    const waitExpr = `Boolean(document.querySelector(${JSON.stringify(targetCss)}))`;
     const waitDeadline = performance.now() + Math.min(timeoutMs, 5_000);
     while (performance.now() < waitDeadline) {
       await sleep(300);
@@ -240,21 +320,39 @@ export async function executeRead(run, input, options = {}) {
     }
 
     // 重试读取
-    result = await doRead(selector);
-    data = result.data;
+    result = await doRead();
+    ({ value, matchesN } = unwrapGet(result));
   }
 
   // 诊断
-  if (data === null || data === undefined || data === "null") {
-    const diagnosis = diagnoseGetNull(data, input);
-    return { ...result, data: { value: null, property, diagnosis } };
+  if (value === null || value === undefined || value === "null") {
+    const diagnosis = diagnoseGetNull(value, { ...input, selector: targetCss });
+    return { ...result, data: { property, value: null, diagnosis } };
   }
-  if (typeof data === "string" && data.trim() === "" && property === "text") {
-    const diagnosis = diagnoseGetNull(data, input);
-    return { ...result, data: { value: "", property, diagnosis } };
+  if (typeof value === "string" && value.trim() === "" && property === "text") {
+    const diagnosis = diagnoseGetNull(value, { ...input, selector: targetCss });
+    return { ...result, data: { property, value: "", diagnosis } };
   }
 
-  return { ...result, data: { value: data, property, chars: typeof data === "string" ? data.length : undefined } };
+  const data = { property, value, chars: typeof value === "string" ? value.length : undefined };
+
+  if (isHtml) {
+    // `get html` has no --nth; surface that a requested nth was ignored.
+    if (nth !== undefined) {
+      data.nth_ignored = true;
+      data.note = "property 'html' has no --nth; nth was ignored.";
+    }
+  } else {
+    if (matchesN !== undefined) data.matches_n = matchesN;
+    if (nth !== undefined) {
+      data.nth = nth;
+    } else if (typeof matchesN === "number" && matchesN > 1) {
+      data.ambiguous_selector = true;
+      data.hint = `Selector matched ${matchesN} elements; the value returned is the first match. Pass nth (0-based) to pick one, or use a more specific selector.`;
+    }
+  }
+
+  return { ...result, data };
 }
 
 // ─────────────────────────────────────────────
@@ -263,8 +361,8 @@ export async function executeRead(run, input, options = {}) {
 
 export async function executeOpen(run, input, options = {}) {
   const timeoutMs = options.timeoutMs ?? input.timeout_ms ?? 15_000;
-  const args = ["open", input.url];
-  if (input.window) args.push("--window", input.window);
+  const args = browserArgs(input.session, "open", input.url);
+  appendOption(args, "--window", input.window);
   appendTab(args, input.tab);
   try {
     return await run(args, { timeoutMs });

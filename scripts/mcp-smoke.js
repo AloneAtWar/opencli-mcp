@@ -8,6 +8,7 @@ const transport = new StdioClientTransport({
   command: process.execPath,
   args: [path.join(root, "bin", "opencli-mcp.js")],
   stderr: "inherit",
+  env: process.env,
 });
 const client = new Client({ name: "opencli-mcp-smoke", version: "0.1.0" });
 
@@ -17,7 +18,7 @@ try {
   if (tools.tools.length < 15) throw new Error(`Expected at least 15 tools, got ${tools.tools.length}`);
   const status = await client.callTool({ name: "opencli_status", arguments: { doctor: false } });
   if (status.isError) throw new Error(JSON.stringify(status.content));
-  const list = await client.callTool({ name: "opencli_list", arguments: {} });
+  const list = await client.callTool({ name: "opencli_adapter_list", arguments: {} });
   if (list.isError) throw new Error(JSON.stringify(list.content));
   const listed = list.structuredContent?.value;
   console.log(JSON.stringify({

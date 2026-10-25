@@ -37,7 +37,7 @@ Hermes / Claude Code / Codex / 其他 MCP Client
 `0.1.0` MVP，已在真实场景中验证（百度/小红书/GitHub 搜索、批量笔记正文提取、结构化数据收集）：
 
 - Windows Node.js MCP 握手与工具发现；
-- 自动发现 OpenCLIApp 内置的 OpenCLI Node 入口；
+- 自动发现 OpenCLIApp 内置与 npm 全局安装的 OpenCLI Node 入口；
 - OpenCLI daemon 和 Chrome Extension 实时连通；
 - 真实 Chrome 中打开任意网站；
 - DOM snapshot、标题读取；
@@ -54,24 +54,72 @@ Hermes / Claude Code / Codex / 其他 MCP Client
 - Windows Chrome 已安装并启用 OpenCLI Browser Bridge 扩展；
 - `opencli doctor` 输出 daemon、extension、connectivity 均为 OK。
 
-当前自动发现优先支持 OpenCLIApp 安装布局：
+以下两种常见安装都会被自动发现，无需设置环境变量：
 
 ```text
-%LOCALAPPDATA%\OpenCLIApp\node_modules\@jackwener\opencli\dist\src\main.js
+%LOCALAPPDATA%\OpenCLIApp\node_modules\@jackwener\opencli\dist\src\main.js   # OpenCLIApp bundled
+%APPDATA%\npm\node_modules\@jackwener\opencli                              # npm i -g
 ```
 
-其他安装方式可通过环境变量指定原生可执行入口：
+自动发现还覆盖 WSL 与 Windows fnm。npm 全局安装从包 `package.json` 声明的 `bin` 字段读取 CLI 入口，不再依赖固定
+入口路径；OpenCLIApp 与 WSL 路径仍按各自的已知布局探测。
+
+`OPENCLI_MCP_BIN` / `OPENCLI_MCP_PREFIX_ARGS` 现在只是纯粹的覆盖 / 逃生舱手段，仅在需要指向非标准安装时使用。
+优先级、`.opencli-mcp.json` 项目配置、变量分类规则与按客户端配置方式见下文「OpenCLI 入口解析与配置」。
+
+## OpenCLI 入口解析与配置
+
+`resolveOpenCli()`（`src/opencli-runner.js`）按以下**优先级**决定如何启动 OpenCLI：
 
 ```text
-OPENCLI_MCP_BIN
-OPENCLI_MCP_PREFIX_ARGS
+OPENCLI_MCP_BIN（环境变量）
+  > .opencli-mcp.json（项目配置文件）
+    > 自动发现
 ```
 
-`OPENCLI_MCP_PREFIX_ARGS` 必须是 JSON 字符串数组，例如：
+**自动发现顺序**：OpenCLIApp bundled 布局（Windows）→ npm 全局安装 → WSL → Windows fnm。npm 全局探测依次检查：
+
+```text
+path.dirname(process.execPath)\node_modules\@jackwener\opencli
+%APPDATA%\npm\node_modules\@jackwener\opencli
+PATH 各目录下的 node_modules\@jackwener\opencli
+```
+
+命中后读取该包 `package.json` 声明的 `bin` 字段作为 CLI 入口（不再硬编码 `dist/src/main.js`）。
+
+### 项目配置文件 `.opencli-mcp.json`
+
+从 cwd 逐级向上查找，最后回退到用户主目录；可提交到仓库随版本化，例如：
+
+```json
+{ "bin": "node", "prefixArgs": ["C:\\Users\\<user>\\AppData\\Roaming\\npm\\node_modules\\@jackwener\\opencli\\dist\\src\\main.js"] }
+```
+
+### `OPENCLI_MCP_BIN` 分类规则
+
+| 值 | 行为 |
+|---|---|
+| `.js` / `.mjs` / `.cjs` | 用当前 Node 运行时执行（`process.execPath`） |
+| 原生可执行（Windows 下 `.exe`） | 直接执行 |
+| 裸命令名（如 `node`） | Windows 上按 `PATH` + `PATHEXT` 解析 |
+| `.ps1` / `.cmd` / `.bat` 或无扩展名 shim | **快速失败**并给出可操作提示，不再抛出裸 `spawn EFTYPE` |
+
+`OPENCLI_MCP_PREFIX_ARGS`（可选，JSON 字符串数组）追加在 `.js` 入口之后：
 
 ```json
 ["C:\\path\\to\\opencli\\dist\\src\\main.js"]
 ```
+
+### 按客户端配置环境（推荐）
+
+| 客户端 | 配置位置 |
+|---|---|
+| stdio 客户端 | `mcp_servers` 定义中的 `env` 块（随客户端配置版本化，最精确） |
+| Hermes HTTP | systemd unit 的 `Environment=` |
+| 兜底 | 机器级 / 用户级环境变量，或 `$PROFILE`，仅在以上都不适用时使用 |
+
+> 注意：环境变量由长驻进程在**启动时**继承。改动 `OPENCLI_MCP_BIN` / `OPENCLI_MCP_PREFIX_ARGS`（或 `$PROFILE`）后，
+> 必须**重启长驻宿主**（例如 `tunnel-client run --profile opencli-mcp`），仅重连 MCP 客户端不够。
 
 ## 安装
 
@@ -149,8 +197,8 @@ agent:
 
 | 工具 | 说明 |
 |---|---|
-| `opencli_status` | 查看版本或执行 `opencli doctor` |
-| `opencli_list` | 列出已安装站点 adapter |
+| `opencli_status` | 查看版本或执行 `opencli doctor`；同时报告 OpenCLI 入口解析来源（`resolution.command` / `prefixArgs` / `source`） |
+| `opencli_adapter_list` | 按关键词搜索已安装站点 adapter；省略 `keywords` 返回全部，默认 `limit` 50 |
 | `opencli_run` | 以结构化 argv 调用任意站点 adapter |
 
 ### 页面观察
@@ -163,7 +211,7 @@ agent:
 | `browser_snapshot_compact` | 未知/嘈杂网站的限长快照；语义化压缩优先保留内容行，省略导航/页脚等 chrome |
 | `browser_find` | CSS/role/name/label/text/testid 查询；`nth` 在 MCP 层本地选择 |
 | `browser_get` | 只读页面状态：title/url/value/attributes |
-| `browser_read` | 内容提取：text/html；找不到元素时自动 scroll + retry 触发懒加载；失败返回诊断 |
+| `browser_read` | 内容提取：text/html；`target`（`browser_snapshot`/`browser_find` 的 ref 或 CSS selector）或 `selector` 别名，多匹配时用 `nth`（0 基）选择第 N 项；找不到元素时自动 scroll + retry 触发懒加载；多匹配且未传 `nth` 返回 `ambiguous_selector` / `matches_n` / `hint`；失败返回诊断；Markdown 长文请用 `browser_extract` |
 | `browser_collect` | 用声明式 CSS 字段从重复卡片/表格/Feed 收集结构化记录；支持 discover 侦察、fallback_text、deduplicate_by、exclude 过滤；selector 匹配 0 时自动进入 discover |
 | `browser_extract` | Markdown 长文分块提取 |
 | `browser_screenshot` | PNG MCP image，支持 ref 标注和全页截图 |
@@ -193,11 +241,12 @@ match_level: exact | stable | reidentified
 `browser_fill_submit` 把“填值并提交”压成一次 MCP 调用：
 
 - CSS target 默认在一次页面执行中设置原生 input/textarea value、派发 input/change、聚焦并派发 Enter 键事件；
+- 数字 ref 现在会被解析为 `[data-opencli-ref="N"]` 并走同一条原子 DOM 路径（此前会静默退回 CLI 路径）；ref 已失效时记录 `atomic_skipped: true` + `atomic_error` 后回退；
 - `submit_strategy` 支持三种模式：
   - `form`（默认）：派发事件后尝试 `requestSubmit()`，适合百度等传统表单；
   - `event`：只派发键盘事件，不触发表单提交，适合纯 JS 监听 Enter 的 SPA；
   - `both`：先派发事件再尝试 `requestSubmit()`；
-- ref 或语义定位可设 `atomic=false`，回退为官方 CLI 的 `fill → focus → keys`；
+- 回退为官方 CLI 的 `fill → focus → keys` 时（显式 `atomic=false` 或 ref 失效），结果显式返回 `atomic_skipped`、`focus_ok`、`submit_verified`、`url_before`、`url_after` 与 `warnings`（`focus_failed` / `submit_not_verified`），不再伪装成成功；
 - 该工具保证提交事件被派发，后续仍应通过 `browser_wait_any` 验证导航或内容就绪。
 
 `browser_wait_any` 的条件支持 `tier` 优先级：
@@ -298,7 +347,7 @@ match_level: exact | stable | reidentified
 ### 优先使用 Adapter
 
 ```text
-opencli_list
+opencli_adapter_list
   ├─ 已有命令 → opencli_run
   └─ 没有命令 → browser_open
 ```
@@ -375,6 +424,7 @@ hermes-default
 - MCP 不接受完整 shell command 字符串。
 - Adapter 的 `site` 和 `command` 只允许字母、数字、点、下划线和短横线。
 - `OPENCLI_MCP_DEBUG=1` 才会在错误结果中附带内部 invocation/stderr。
+- 启动期自检在 MCP 握手后后台试跑一次 `opencli --version`，结果只写 stderr（成功后形如 `[opencli-mcp] preflight ok: <version> | command: ... | source: ...`）；可用 `OPENCLI_MCP_SKIP_PREFLIGHT=1` 关闭。
 - 默认单次命令超时 90 秒，可通过 `OPENCLI_MCP_TIMEOUT_MS` 调整。
 - stdout/stderr 各自限制为 32 MiB，避免异常页面耗尽 Agent 内存。
 - MCP 能以用户身份操作已登录网站。建议使用专门的 Chrome Agent Profile，不要同时登录网银、交易所主账户或最高权限生产后台。
@@ -385,7 +435,7 @@ hermes-default
 1. OpenCLI 对跨域 OOPIF 的完整 AX snapshot/click/type 路由仍是 best-effort；可尝试 `browser_frames + browser_eval(frame=...)`。
 2. `browser_eval` 按 OpenCLI 约定用于定向读取，不建议用它代替结构化写操作。
 3. Windows MCP 不能直接把 WSL `/tmp/...` 当作上传路径；上传前应复制到 Windows 可访问目录。
-4. 当前 OpenCLIApp 自动发现使用其 bundled package，GUI App 版本和 bundled CLI 版本可能相差一个补丁版本；`opencli_status` 会报告实际被调用的版本。
+4. npm 全局安装不再依赖固定入口路径，而是读取包 `package.json` 声明的 `bin` 字段；OpenCLIApp 与 WSL 路径仍按各自的已知布局探测。OpenCLIApp 使用其 bundled package，GUI App 版本和 bundled CLI 版本可能相差一个补丁版本，`opencli_status` 会报告实际被调用的版本与解析来源。另需注意：环境变量由长驻进程在启动时继承，改动 `OPENCLI_MCP_BIN` / `OPENCLI_MCP_PREFIX_ARGS`（或 `$PROFILE`）后必须重启宿主进程才生效。
 5. 目前不自动修改 Hermes 配置，也不自动禁用内建 browser。
 6. Hermes MCP client 会把 `boolean` 和 `object` 参数序列化为字符串；相关工具的 schema 已改为 `z.union([z.boolean(), z.string()])` 并在 handler 内强制转换，调用方无需关心。
 7. GitHub 等站点的 README 在 `<turbo-frame>` 内延迟加载；`browser_read` 的 `auto_scroll_retry` 默认能处理，但极慢的网络下可能需要调大 `timeout_ms`。
