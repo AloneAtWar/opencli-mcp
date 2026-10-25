@@ -4,7 +4,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, readdir, lstat, realpath, open, readFile, writeFile, rename, rm } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { boundedText, redactSecrets, summarizeCliResult, summarizeFailure, urlSecrets } from './cli-failure.js';
+import { boundedText, isNavigationRejected, redactSecrets, summarizeCliResult, summarizeFailure, urlSecrets } from './cli-failure.js';
 
 const CONTAINER = 'opencli-xhs-images';
 const MANIFEST = '.opencli-xhs-owned.json';
@@ -12,7 +12,32 @@ const active = new Set();
 const quarantined = new Set();
 const locks = new Map();
 const MIB = 1024 * 1024;
+// Per-response limits for the images subcommand (one constant per limit so the
+// code, the error text and the help line cannot drift apart).
+const MAX_RESPONSE_IMAGES = 20;
+const MAX_IMAGE_BYTES = 10 * MIB;
+const MAX_TOTAL_IMAGE_BYTES = 20 * MIB;
+// ChatGPT drops a tool result that carries more than one image block outright:
+// the text block disappears with it. One block renders fine, so the per-response
+// image-block budget defaults to one; it is not a resource cap (the limits above
+// still apply) and clients that handle several images can raise it, up to 20.
+const DEFAULT_IMAGE_BLOCKS_PER_RESPONSE = 1;
+const IMAGE_BLOCKS_PER_RESPONSE_ENV = 'OPENCLI_XIAOHONGSHU_IMAGE_BLOCKS_PER_RESPONSE';
 const CLEANUP_PENDING = { code: 'CLEANUP_PENDING', message: 'Managed-cache cleanup could not finish; the cache may stay over its budget until a later call retries' };
+// OPENCLI_SITE_SESSION is a session *lifecycle* (ephemeral | persistent), not a
+// session name. A refused navigation under the default ephemeral adapter window
+// is retried as persistent, and an explicitly persistent run is retried as
+// ephemeral, so the replay starts on a different lifecycle instead of reusing
+// the tab that could not navigate.
+function retrySessionFor(env) {
+  return String(env?.OPENCLI_SITE_SESSION) === 'persistent' ? 'ephemeral' : 'persistent';
+}
+// TIMEOUT / OUTPUT_LIMIT are the runner's codes for "we stopped the process".
+// They carry quarantine semantics (the writer may still be alive), so they must
+// never be mistaken for a replayable failure just because the text happens to
+// mention a rejected navigation.
+const TERMINATION_CODES = /TIMEOUT|OUTPUT_LIMIT/i;
+const isTerminationFailure = (error) => TERMINATION_CODES.test(String(error?.details?.code ?? error?.code));
 const IMAGES_HELP = [
   'opencli_run(site="xiaohongshu", command="images") returns one note\'s images as native MCP ImageContent.',
   '',
@@ -23,6 +48,7 @@ const IMAGES_HELP = [
   '  --timeout-ms 60000    CLI download timeout in ms (default 90000, hard max 600000)',
   '',
   'returns: content[] image blocks plus a JSON metadata block; structuredContent.status/images/errors.',
+  `limits: ${DEFAULT_IMAGE_BLOCKS_PER_RESPONSE} image block per response by default (${IMAGE_BLOCKS_PER_RESPONSE_ENV}, max ${MAX_RESPONSE_IMAGES}; extra requested indexes go to skipped_indexes), ${MAX_IMAGE_BYTES / MIB} MiB each, ${MAX_TOTAL_IMAGE_BYTES / MIB} MiB total; byte overruns are reported in errors[].`,
   'No output argument: the success payload carries no local paths, though a CLI failure message may quote one. Root: OPENCLI_XIAOHONGSHU_DOWNLOAD_DIR, else the server OS Downloads folder.',
 ].join('\n');
 function positiveIntegerArg(value, label) {
@@ -45,6 +71,9 @@ function positive(env, key, fallback) {
   if (value === undefined) return fallback;
   if (!/^[1-9]\d*$/.test(String(value)) || !Number.isSafeInteger(Number(value))) throw new Error(`${key} must be a positive integer`);
   return Number(value);
+}
+function resolveImageBlocksPerResponse(env) {
+  return Math.min(MAX_RESPONSE_IMAGES, positive(env, IMAGE_BLOCKS_PER_RESPONSE_ENV, DEFAULT_IMAGE_BLOCKS_PER_RESPONSE));
 }
 export function resolveDownloadRoot(env = process.env, deps = {}) {
   const platform = deps.platform ?? process.platform;
@@ -77,19 +106,6 @@ export function resolveDownloadRoot(env = process.env, deps = {}) {
   if (platform === 'win32' && /^[a-z]:(?![\\/])/i.test(selected)) throw new Error(`Windows drive-relative paths are unsupported: ${selected}`);
   if (platform !== 'win32' && (/^[a-z]:/i.test(selected) || /^\\\\/.test(selected))) throw new Error('Foreign Windows paths are unsupported on this server platform');
   return { download_root: p.resolve(cwd, selected), directory_source: source };
-}
-export function describeMediaCache(env = process.env, cwd = process.cwd()) {
-  try {
-    const resolved = resolveDownloadRoot(env, { cwd });
-    return {
-      download_root: resolved.download_root,
-      directory_source: resolved.directory_source,
-      image_cache_max_files: positive(env, 'OPENCLI_XIAOHONGSHU_IMAGE_CACHE_MAX_FILES', 10),
-      download_cache_max_mb: positive(env, 'OPENCLI_XIAOHONGSHU_DOWNLOAD_CACHE_MAX_MB', 100),
-    };
-  } catch (error) {
-    return { error: error.message };
-  }
 }
 function mime(bytes, filename = '') {
   if (bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255) return 'image/jpeg';
@@ -230,6 +246,23 @@ function primaryError(errors) {
     ...(first.stderr_tail === undefined ? {} : { stderr_tail: first.stderr_tail }),
   };
 }
+// Effective media-cache configuration. A long-lived server inherits its
+// environment at start, so an operator needs a way to see which root and limits
+// this process actually got instead of guessing.
+export function describeMediaCache(env = process.env, cwd = process.cwd()) {
+  try {
+    const resolved = resolveDownloadRoot(env, { cwd });
+    return {
+      download_root: resolved.download_root,
+      directory_source: resolved.directory_source,
+      image_cache_max_files: positive(env, 'OPENCLI_XIAOHONGSHU_IMAGE_CACHE_MAX_FILES', 10),
+      download_cache_max_mb: positive(env, 'OPENCLI_XIAOHONGSHU_DOWNLOAD_CACHE_MAX_MB', 100),
+      image_blocks_per_response: resolveImageBlocksPerResponse(env),
+    };
+  } catch (error) {
+    return { error: error.message };
+  }
+}
 export function createXiaohongshuMedia({ run, env = process.env, cwd = process.cwd() }) {
   async function clean(root, maxBytes, maxImages, protect) {
     try { return await cleanup(root, maxBytes, maxImages, protect); }
@@ -254,6 +287,7 @@ export function createXiaohongshuMedia({ run, env = process.env, cwd = process.c
     if (run.executionPlatform && run.executionPlatform !== process.platform) throw new Error('Cross-OS media downloads are unsupported: execution platform differs from server');
     const maxBytes = positive(env, 'OPENCLI_XIAOHONGSHU_DOWNLOAD_CACHE_MAX_MB', 100) * 1000000;
     const maxImages = positive(env, 'OPENCLI_XIAOHONGSHU_IMAGE_CACHE_MAX_FILES', 10);
+    const imageBlockBudget = resolveImageBlocksPerResponse(env);
     if (kind === 'images' && input.output !== undefined) throw new Error('images does not accept output');
     if (input.image_indexes !== undefined && (!Array.isArray(input.image_indexes) || input.image_indexes.some(i => !Number.isSafeInteger(i) || i < 1) || new Set(input.image_indexes).size !== input.image_indexes.length)) throw new Error('image_indexes must contain unique positive integers');
     const resolved = resolveDownloadRoot(env, { output: input.output, cwd });
@@ -264,20 +298,53 @@ export function createXiaohongshuMedia({ run, env = process.env, cwd = process.c
     if ((await lstat(parent)).isSymbolicLink() || await realpath(parent) !== parent) throw new Error('Unsafe images container');
     const name = `opencli-xhs-${Date.now()}-${randomUUID()}`, dir = path.join(parent, name);
     active.add(dir);
-    let cli, failure, files = [], complete = true, unconfirmed = false;
+    let cli, failure, files = [], complete = true, unconfirmed = false, retry;
+    // Chrome can refuse the first navigation when the automation tab was closed
+    // or replaced between lease resolution and tabs.update. These commands only
+    // read the note and write into this call's own directory, so one replay on a
+    // separate browser session is safe and usually lands on a fresh tab.
+    const callOnce = (session) => run(
+      ['xiaohongshu', 'download', input.note_url, ...extra, '--output', dir, '-f', 'json'],
+      { timeoutMs: input.timeout_ms, ...(session ? { env: { OPENCLI_SITE_SESSION: session } } : {}) },
+    );
+    const recordFailure = async (error) => {
+      failure = error;
+      cli = { ok: false, ...error.details, error: { code: error.details?.code ?? error.code ?? 'CLI_ERROR', message: error.message } };
+      const stoppedError = isTerminationFailure(error);
+      complete = !stoppedError;
+      unconfirmed = stoppedError && error.details?.termination_confirmed !== true;
+      if (unconfirmed) {
+        quarantined.add(dir);
+        await locked(root, async () => { const data = await manifest(root); const task = data.tasks.find(t => t.name === name); if (task) task.quarantined = true; await saveManifest(root, data); });
+      }
+    };
     try {
       // A crashed or unconfirmed writer stays quarantined across server restarts.
       await locked(root, async () => { await mkdir(dir); const data = await manifest(root); const created = Math.max(Date.now(), ...data.tasks.map(t => (Number(t.created) || 0) + 1)); data.tasks.push({ name, kind, created, quarantined: true }); await saveManifest(root, data); });
-      try { cli = await run(['xiaohongshu', 'download', input.note_url, ...extra, '--output', dir, '-f', 'json'], { timeoutMs: input.timeout_ms }); }
+      try { cli = await callOnce(); }
       catch (error) {
-        failure = error;
-        cli = { ok: false, ...error.details, error: { code: error.details?.code ?? error.code ?? 'CLI_ERROR', message: error.message } };
-        const stoppedError = /TIMEOUT|OUTPUT_LIMIT/i.test(String(error.details?.code ?? error.code));
-        complete = !stoppedError;
-        unconfirmed = stoppedError && error.details?.termination_confirmed !== true;
-        if (unconfirmed) {
-          quarantined.add(dir);
-          await locked(root, async () => { const data = await manifest(root); const task = data.tasks.find(t => t.name === name); if (task) task.quarantined = true; await saveManifest(root, data); });
+        // A stopped run may leave a live process still writing into this
+        // directory, so it always takes the quarantine path: replaying it would
+        // let a half-written directory be reported as this call's inventory.
+        if (isTerminationFailure(error) || !isNavigationRejected(error)) {
+          await recordFailure(error);
+        } else {
+          const session = retrySessionFor(env);
+          retry = { reason: 'navigation_rejected', attempts: 2, session };
+          // The first attempt may have left files behind before its navigation was
+          // refused. The replay owns this request directory, so it starts clean:
+          // only a normally-exited run reaches this branch (a stopped run takes the
+          // quarantine path above), so nothing is still writing here.
+          await locked(root, async () => { await rm(dir, { recursive: true, force: true }); await mkdir(dir); });
+          try {
+            cli = await callOnce(session);
+            // outcome is filled in from the final status below: a replay that
+            // returns while the CLI still reported per-item failures resolved
+            // nothing, so it must not be recorded as a success.
+          } catch (retryError) {
+            await recordFailure(retryError);
+            retry.outcome = 'failed';
+          }
         }
       }
       if (!unconfirmed) await locked(root, async () => { const data = await manifest(root); const task = data.tasks.find(t => t.name === name); if (task) task.quarantined = false; await saveManifest(root, data); });
@@ -288,6 +355,7 @@ export function createXiaohongshuMedia({ run, env = process.env, cwd = process.c
       if (kind === 'download') {
         const cleanupErrors = await clean(root, maxBytes, maxImages, dir);
         const status = cliFailed ? (files.length ? 'partial' : 'error') : 'success';
+        if (retry && retry.outcome === undefined) retry.outcome = status;
         const failedIndexes = failedRows.map(row => row.index).filter(index => Number.isSafeInteger(index));
         const failedDetail = failedRows.map(row => boundedText(row.size, { secrets, limit: 300 })).find(Boolean);
         const failureSummary = failure
@@ -303,7 +371,7 @@ export function createXiaohongshuMedia({ run, env = process.env, cwd = process.c
           ...(failedIndexes.length ? { failed_indexes: failedIndexes } : {}),
           ...summaryExtras(failureSummary),
         };
-        return result({ status, path_scope: 'server_local', server_platform: process.platform, managed_cache: true, download_root: root, output_directory: dir, directory_source: resolved.directory_source, files: files.map(({ mtime, ...file }) => file), cli_result: redact(cli, input.note_url), inventory_complete: complete, errors: cleanupErrors, ...(error ? { error } : {}) });
+        return result({ status, path_scope: 'server_local', server_platform: process.platform, managed_cache: true, download_root: root, output_directory: dir, directory_source: resolved.directory_source, files: files.map(({ mtime, ...file }) => file), cli_result: redact(cli, input.note_url), inventory_complete: complete, errors: cleanupErrors, ...(retry ? { retry } : {}), ...(error ? { error } : {}) });
       }
       const blocks = [], images = [], errors = [];
       if (failure) {
@@ -331,21 +399,26 @@ export function createXiaohongshuMedia({ run, env = process.env, cwd = process.c
       const availableIndexes = candidates.map(file => file.index);
       const selected = input.image_indexes ? [...input.image_indexes].sort((a,b) => a - b) : availableIndexes;
       let total = 0;
+      const skippedIndexes = [];
       for (const index of selected) {
         const file = candidates.find(f => f.index === index);
         if (!file) { errors.push({ index, code: 'IMAGE_NOT_FOUND', available_indexes: availableIndexes, message: `The CLI downloaded no image for media index ${index}${availableIndexes.length ? `; available image indexes: ${availableIndexes.join(', ')}` : '; this note produced no image files'}` }); continue; }
-        if (images.length >= 10 || file.size_bytes > 10 * MIB || total + file.size_bytes > 20 * MIB) { errors.push({ index, code: 'IMAGE_LIMIT', size_bytes: file.size_bytes, message: `Media index ${index} exceeds the response limits (at most 10 images, 10 MiB each, 20 MiB total)` }); continue; }
+        // Extra requested indexes are paging, not an error: ChatGPT drops a
+        // result that carries several image blocks, so the caller asks for the
+        // rest with --indexes once it has consumed this one.
+        if (images.length >= imageBlockBudget) { skippedIndexes.push(index); continue; }
+        if (file.size_bytes > MAX_IMAGE_BYTES || total + file.size_bytes > MAX_TOTAL_IMAGE_BYTES) { errors.push({ index, code: 'IMAGE_LIMIT', size_bytes: file.size_bytes, message: `Media index ${index} exceeds the response byte limits (at most ${MAX_IMAGE_BYTES / MIB} MiB each, ${MAX_TOTAL_IMAGE_BYTES / MIB} MiB total)` }); continue; }
         let handle;
         try {
           const stat = await lstat(file.local_path);
-          if (!stat.isFile() || stat.isSymbolicLink() || await realpath(file.local_path) !== file.local_path || stat.size > 10 * MIB) throw new Error('Unsafe image');
+          if (!stat.isFile() || stat.isSymbolicLink() || await realpath(file.local_path) !== file.local_path || stat.size > MAX_IMAGE_BYTES) throw new Error('Unsafe image');
           handle = await open(file.local_path, 'r');
           const opened = await handle.stat();
           if (opened.size !== stat.size || opened.ino !== stat.ino || opened.dev !== stat.dev) throw new Error('Changed image');
           const bytes = Buffer.alloc(stat.size + 1);
           let count = 0;
           while (count < bytes.length) { const read = await handle.read(bytes, count, bytes.length - count, count); if (!read.bytesRead) break; count += read.bytesRead; }
-          if (count !== stat.size || total + count > 20 * MIB) throw new Error('Changed image size');
+          if (count !== stat.size || total + count > MAX_TOTAL_IMAGE_BYTES) throw new Error('Changed image size');
           const data = bytes.subarray(0, count), type = mime(data);
           if (!type.startsWith('image/')) throw new Error('Unrecognized image bytes');
           blocks.push({ type: 'image', data: data.toString('base64'), mimeType: type }); images.push({ index, mime_type: type, size_bytes: count }); total += count;
@@ -356,9 +429,10 @@ export function createXiaohongshuMedia({ run, env = process.env, cwd = process.c
       active.delete(dir);
       errors.push(...await clean(root, maxBytes, maxImages, null));
       const status = errors.length ? (images.length ? 'partial' : 'error') : 'success';
+      if (retry && retry.outcome === undefined) retry.outcome = status;
       const error = status === 'success' ? undefined : primaryError(errors);
       const noteIds = [...new Set(files.flatMap(file => { const relative = path.relative(dir, file.local_path).split(path.sep); return relative.length > 1 ? [relative[0]] : []; }))];
-      return result({ status, managed_cache: true, inventory_complete: complete, ...(noteIds.length === 1 ? { note_id: noteIds[0] } : {}), available_indexes: availableIndexes, images, errors, ...(error ? { error } : {}) }, blocks);
+      return result({ status, managed_cache: true, inventory_complete: complete, ...(noteIds.length === 1 ? { note_id: noteIds[0] } : {}), available_indexes: availableIndexes, image_blocks_per_response: imageBlockBudget, ...(skippedIndexes.length ? { skipped_indexes: skippedIndexes } : {}), images, errors, ...(retry ? { retry } : {}), ...(error ? { error } : {}) }, blocks);
     } finally { active.delete(dir); }
   }
   return {

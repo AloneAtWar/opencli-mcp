@@ -515,6 +515,24 @@ export function createOpenCliRunner(options = {}) {
   };
   const killTree = options.killTree ?? defaultKillTree;
 
+  // Windows environment keys are case-insensitive: spreading "Path" over "PATH"
+  // would leave both in the child environment and let the OS pick unpredictably,
+  // which can silently drop PATH. An override replaces any casing of its key.
+  const mergeEnv = (base, override) => {
+    if (!override) return base;
+    const merged = { ...base };
+    for (const [key, value] of Object.entries(override)) {
+      if (isWindowsHost) {
+        const lower = key.toLowerCase();
+        for (const existing of Object.keys(merged)) {
+          if (existing !== key && existing.toLowerCase() === lower) delete merged[existing];
+        }
+      }
+      merged[key] = value;
+    }
+    return merged;
+  };
+
   const runOpenCli = async function runOpenCli(args, callOptions = {}) {
     if (!Array.isArray(args) || args.some((arg) => typeof arg !== "string")) {
       throw new TypeError("OpenCLI arguments must be a string array");
@@ -528,7 +546,10 @@ export function createOpenCliRunner(options = {}) {
         shell: false,
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
-        env: options.env ?? process.env,
+        // A per-call env is merged over the runner env, so a caller can retry on a
+        // different browser session without rebuilding the runner for the whole
+        // process and without having to restate PATH and friends.
+        env: mergeEnv(options.env ?? process.env, callOptions.env),
         cwd: callOptions.cwd ?? options.cwd,
         detached: !isWindowsHost,
       });

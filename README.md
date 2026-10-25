@@ -197,15 +197,17 @@ agent:
 
 | 工具 | 说明 |
 |---|---|
-| `opencli_status` | 查看版本或执行 `opencli doctor`；同时报告 OpenCLI 入口解析来源（`resolution.command` / `prefixArgs` / `source`）、当前 MCP 进程实际生效的媒体缓存限制 |
+| `opencli_status` | 查看版本或执行 `opencli doctor`；同时报告 OpenCLI 入口解析来源（`resolution.command` / `prefixArgs` / `source`）、当前 MCP 进程实际生效的媒体缓存限制与站点闸门配置 |
 | `opencli_adapter_list` | 按关键词搜索已安装站点 adapter；省略 `keywords` 返回全部，默认 `limit` 50 |
 | `opencli_run` | 以结构化 argv 调用任意站点 adapter |
 
-`opencli_adapter_list` 只收录 CLI adapter；小红书媒体由 `opencli_run` 子命令提供（MCP-only，不在 adapter 目录里），不出现在该列表中。宿主（ChatGPT / Codex）在 App/连接器获批时会冻结一份 `tools/list` 快照：`tools/call` 始终执行本 Server 的实时代码，但新增工具、改名和描述变更只有在宿主侧刷新 App/连接器（ChatGPT 为 App/连接器设置里的 Refresh；仍不生效时删除并重新添加连接器）之后才会出现在工具列表里。本设计把小红书媒体收敛进 `opencli_run`，工具清单保持 26 个不变，因此不依赖这次刷新。重启本 MCP Server、tunnel 或客户端都不会刷新这份快照。
+`opencli_adapter_list` 只收录 CLI adapter；`xiaohongshu/download` 是 OpenCLI 已有的 adapter，会出现在该列表中，但通过 `opencli_run` 调用时由 MCP 层接管并增加受管缓存与文件核验。`images` 是 MCP 层组合，CLI 侧没有对应命令，因此不会出现在 adapter 目录里。该工具的结果另外带有 `mcp_handled_subcommands` 字段，说明这两个入口在 MCP 层的语义，避免 agent 只在 adapter 数组里找。宿主（ChatGPT / Codex）在 App/连接器获批时会冻结一份 `tools/list` 快照：`tools/call` 始终执行本 Server 的实时代码，但新增工具、改名和描述变更只有在宿主侧刷新 App/连接器（ChatGPT 为 App/连接器设置里的 Refresh；仍不生效时删除并重新添加连接器）之后才会出现在工具列表里。本设计把小红书媒体收敛进 `opencli_run`，工具清单保持 26 个不变，因此不依赖这次刷新。重启本 MCP Server、tunnel 或客户端都不会刷新这份快照。
+
+`opencli_run` 按站点限制跨调用并发：同一站点默认同时只执行 1 个调用（`OPENCLI_MCP_SITE_CONCURRENCY`），最多再排队 `OPENCLI_MCP_SITE_QUEUE_MAX` 个（默认 8），每个排队调用最多等待 `OPENCLI_MCP_SITE_QUEUE_WAIT_MS` 毫秒（默认 30000）。三个变量都必须是范围内的整数（并发 1–64、队列 1–256、等待 1–2147483647），非法值一律回退默认。超出即返回 `error.code=SITE_BUSY`（`reason` 为 `queue_full` 或 `queue_timeout`，并带 `site` 与 `hint`），而不是继续向站点堆请求；不同站点互不排队。这一层只限制并发，不额外添加间隔或抖动：小红书相关调用在 OpenCLI 侧自带节奏（risk-control 在每次读页面前等待抖动，风控命中后冷却再重试一次），串行化正是让这些进程内等待在多次调用之间继续有效。`opencli_status` 的 `site_gate` 字段报告生效配置与当前忙碌情况。闸门按 MCP 进程划分：stdio 与 HTTP 在同一进程内共用一个计数，多个 MCP 实例各自独立；它限制的是未完成的 `opencli_run` 调用数，进程终止未被证实时旧 CLI 进程可能仍未退出，此时新调用可能与之重叠。`browser_*` 工具不经这个闸门。
 
 ### 小红书下载与图片
 
-小红书媒体只有一个入口：`opencli_run` 的 `xiaohongshu` 子命令 `download` 与 `images`。两者由 MCP 包装层管理目录、核验实际文件并返回结果，复用公开 CLI download，无需改动 OpenCLI，完整行为约定见下文各段。
+小红书媒体只有一个入口：`opencli_run` 的 `xiaohongshu` 子命令 `download` 与 `images`。`download` 包装 OpenCLI 已有的 CLI 命令并管理目录、核验实际文件；`images` 复用同一次下载并返回图片。完整行为约定见下文各段。
 
 两个子命令都通过 `opencli_run` 调用，参数以 argv 数组传入 `args`：
 
@@ -216,7 +218,7 @@ agent:
 
 两个子命令都可用 `--timeout-ms` 指定单次 CLI 下载超时（默认 90 秒、上限 600 秒）。两者都支持 `args=["--help"]`：`download` 输出真实 CLI help 加一段包装层说明，`images` 输出该子命令的参数说明。`opencli_run` 的通用 `format` 参数对这两个子命令无效——包装层内部始终按 JSON 解析 CLI 输出，否则逐媒体失败行会退化成不可解析的文本并掩盖失败。
 
-这两个子命令都不注册进 OpenCLI adapter registry：`images` 是 MCP 层对官方 `xiaohongshu/download` 的组合，CLI 侧不存在 `opencli xiaohongshu images`，因此 `opencli_adapter_list` 里小红书媒体只有官方命令一项。
+`download` 调用的是 OpenCLI 已有的 `xiaohongshu/download` adapter，只是被 MCP 层包装，因此它会出现在 `opencli_adapter_list` 中；`images` 是 MCP 层对同一次 download 的组合，CLI 侧不存在 `opencli xiaohongshu images`，不会注册进 adapter registry。
 
 两个子命令共用同一 download_root：`download` 按显式 `--output` > `OPENCLI_XIAOHONGSHU_DOWNLOAD_DIR` > OS 默认下载目录解析；`images` 不接受 `--output`（传入会报错），按 `OPENCLI_XIAOHONGSHU_DOWNLOAD_DIR` > OS 默认下载目录解析；`images` 的成功结果不返回本地文件路径，但失败文本里可能出现服务端路径——路径是诊断信息，不是机密。
 
@@ -238,9 +240,11 @@ agent:
 
 下载保存到 `<download_root>/opencli-xhs-<unique>/<actual-note-id>/`，每调用独立，避免旧文件混入和并发覆盖。`OPENCLI_XIAOHONGSHU_DOWNLOAD_CACHE_MAX_MB` 默认 100，是覆盖下载请求目录和图片缓存请求目录的统一软预算：超限时两类 taskdir 一起按创建顺序 FIFO 删除，固定的 `opencli-xhs-images` 容器本身保留，用户放在根目录的其他文件不受影响。预算按磁盘实际字节统计（含下载过程中的临时文件），未完成的下载同样占用预算；当前下载、活动任务和 quarantine 任务不会被淘汰，因此单个任务或并发任务可能暂时超过预算。返回的路径可能被后续清理回收，OCR 应及时读取。`opencli_status.media_cache` 报告 MCP 进程实际生效的值，不应使用 agent 自身环境变量推断。
 
-`download` 子命令返回 `files`（`local_path` / `size_bytes` / `mime_type`，路径为服务端本地绝对路径）、`status`、`path_scope="server_local"`、`server_platform`、`managed_cache`、`download_root`、`output_directory`、`directory_source`、`cli_result`、`inventory_complete`，以及 `status` 非 `success` 时的顶层 `error`；`cli_result` 返回前已脱敏（移除 `xsec_token`、cookie/authorization 等凭据及内部 stdout/stderr/invocation）。部分失败仍返回已核验文件，`status` 为 `partial` 或 `error`，失败原因不再只藏在 `cli_result` 里：顶层 `error` 直接携带 CLI 的真实原因——`error.code` 为 `CLI_ERROR`（CLI 进程失败、非零退出或超时）或 `MEDIA_DOWNLOAD_FAILED`（CLI 退出码为 0，但至少一个媒体行失败），`error.message` 是 CLI 自身的原因文本（诊断文本从尾部保留、截断到 600 字符并脱敏），`error.failed_indexes` 在能确定时列出失败的媒体序号；CLI 级失败还带 `cli_error_code`（CLI 自己的错误码：优先结构化错误码，否则是进程退出码或 `TIMEOUT` 这类语义码）、数字退出码 `exit_code`，以及必要时截断到 300 字符的 `stderr_tail`。`errors[]` 仍然只登记清理问题（`CLEANUP_PENDING`，每条都带 `message`），即使状态为 `partial` / `error` 也可能为空。原因来自 CLI `xiaohongshu download` 的逐媒体行（`{index, type, status, size}`，失败行的 `size` 即错误文本）以及类型化异常（如 `SECURITY_BLOCK`、`EmptyResultError`「No downloadable media found on this note.」、畸形 payload）；包装层转发这些真实原因，不再替换成通用句子。
+`download` 子命令返回 `files`（`local_path` / `size_bytes` / `mime_type`，路径为服务端本地绝对路径）、`status`、`path_scope="server_local"`、`server_platform`、`managed_cache`、`download_root`、`output_directory`、`directory_source`、`cli_result`、`inventory_complete`（发生导航重试时还有 `retry`），以及 `status` 非 `success` 时的顶层 `error`；`cli_result` 返回前已脱敏（移除 `xsec_token`、cookie/authorization 等凭据及内部 stdout/stderr/invocation）。部分失败仍返回已核验文件，`status` 为 `partial` 或 `error`，失败原因不再只藏在 `cli_result` 里：顶层 `error` 直接携带 CLI 的真实原因——`error.code` 为 `CLI_ERROR`（CLI 进程失败、非零退出或超时）或 `MEDIA_DOWNLOAD_FAILED`（CLI 退出码为 0，但至少一个媒体行失败），`error.message` 是 CLI 自身的原因文本（诊断文本从尾部保留、截断到 600 字符并脱敏），`error.failed_indexes` 在能确定时列出失败的媒体序号；CLI 级失败还带 `cli_error_code`（CLI 自己的错误码：优先结构化错误码，否则是进程退出码或 `TIMEOUT` 这类语义码）、数字退出码 `exit_code`，以及必要时截断到 300 字符的 `stderr_tail`。`errors[]` 仍然只登记清理问题（`CLEANUP_PENDING`，每条都带 `message`），即使状态为 `partial` / `error` 也可能为空。原因来自 CLI `xiaohongshu download` 的逐媒体行（`{index, type, status, size}`，失败行的 `size` 即错误文本）以及类型化异常（如 `SECURITY_BLOCK`、`EmptyResultError`「No downloadable media found on this note.」、畸形 payload）；包装层转发这些真实原因，不再替换成通用句子。
 
 这套失败摘要由 `src/cli-failure.js` 统一提供，所有 MCP 工具的 CLI 失败（`browser_*`、`opencli_run` 直通等）共用同一实现，统一给出 `code` / `message` / `hint` / `cli_error_code` / `stderr_tail`。脱敏只覆盖凭据与内部字段，**错误信息里的服务端路径保留**：`download` 本来就返回绝对路径，错误里的路径是诊断依据。
+
+媒体子命令对 Chrome 的 `Navigation rejected.` 做一次自动重试。这条错误来自 Chrome 的 Tabs API（`chrome.tabs.update` 在自动化标签被关闭或替换的竞态下拒绝导航），不是风控、也不是登录问题；OpenCLI 全链路只有 Google Images 适配器认识它，小红书路径既不识别也不重试。包装层因此在首次命中时切换 `OPENCLI_SITE_SESSION` 的会话生命周期模式（默认 `ephemeral` 切到 `persistent`；若显式配置为 `persistent` 则反向切到 `ephemeral`）重跑一次，避免继续用那个不可导航的标签页，并在结果里加 `retry`（`reason` / `attempts` / `session` / `outcome`）说明发生过重试。第二次仍失败时按原样返回 CLI 错误（若仍命中该文案，再附上诊断 hint）。重试只覆盖这两个只读的媒体子命令——其它 adapter 命令与所有写类命令一律不重试，因为无法证明失败发生在副作用之前。诊断本身对所有工具生效：当 CLI 未自带 hint 而失败文案命中该错误时，包装层会补一句说明，提示这可能是标签竞态、可以直接重试。
 
 清理与淘汰只针对**本服务拥有**的请求目录：每个 download_root 用一份根目录所有权记录 `.opencli-xhs-owned.json` 登记本服务创建的请求目录（名称形如 `opencli-xhs-<时间戳>-<uuid>`，`download` 位于根目录，`images` 位于 `opencli-xhs-images` 容器内），回收时只认这份记录；用户自建目录、用户文件与固定容器本身永不回收。该记录只是所有权清单，不登记笔记 ID、文件清单或媒体元数据——本功能没有内容注册表，笔记 ID 与图片序号只来自 CLI 实际下载到磁盘的文件。
 
@@ -248,7 +252,7 @@ agent:
 
 `images` 子命令与 `download` 子命令共享同一根目录和同一 100 MB 默认软预算；字节预算按 task 创建时间 FIFO 淘汰最旧的非保护目录。`OPENCLI_XIAOHONGSHU_IMAGE_CACHE_MAX_FILES` 默认 10，只统计 `opencli-xhs-images` 图片子树，不限制 `download` 保存的图片数量；超过时按文件最早修改时间删除。没有 200 张硬上限。图片数量清理先于统一配额清理，两步由同一执行器完成。读取后不立即清空，也不增加 LRU、有效期或缓存命中逻辑。两种清理均避开仍在下载或读取的文件。
 
-`--indexes`（逗号分隔；也可用可重复的 `--index`；两者都不传时返回全部图片）使用**原媒体序号**：序号取自 CLI 落盘文件名 `<note-id>_<n>` 中的 n，从 1 开始、覆盖整篇笔记下载到的全部媒体（含视频），既不依赖目录枚举顺序，也不按过滤后的纯图片列表重新编号；只有位于 `<note-id>/` 一级子目录、且文件名前缀与目录 ID 一致的文件参与映射，其余文件不参与，不做猜测式枚举。视频保留原序号但不作为图片返回。CLI 仍会先下载整篇媒体，`--indexes` 只限制读取与返回范围。`images` 子命令单次响应最多 10 张、单张最大 10 MiB、总计最大 20 MiB，超限项计入逐项错误。`images` 在 `status` 非 `success` 时也返回顶层 `error`（含 `code`、`message`，相关时带 `index` / `available_indexes` / `cli_error_code` / `exit_code` / `hint` / `stderr_tail`），并始终返回顶层 `available_indexes`（本次笔记磁盘上真实存在的 1 基媒体序号）；当下载产物只对应一个笔记 ID 时还返回顶层 `note_id`（公开笔记 ID，不是本地路径，xsec_token 与 cookies 仍不返回）。`errors[]` 每条都带人类可读的 `message`，相关时还带 `index`、`detail`（CLI 自己的逐项原因，如 "HTTP 403 Forbidden"）、`available_indexes`、`size_bytes`、`cli_error_code` 或 `exit_code`；错误码为 `IMAGE_DOWNLOAD_FAILED`（CLI 原因在 `detail` / `message`）、`IMAGE_NOT_FOUND`（`message` 列出可用序号）、`IMAGE_LIMIT`、`IMAGE_READ_FAILED`、`IMAGE_INDEX_UNMAPPABLE`、`IMAGE_INDEX_AMBIGUOUS`、`NO_IMAGES`、`CLI_ERROR`（`message` 为 CLI 的真实消息，如风控/安全拦截文本或 "No downloadable media found on this note."）、`TERMINATION_UNCONFIRMED` 与 `CLEANUP_PENDING`（清理类条目也带 `message`）。agent 应先读 `error.code` / `error.message` 定位原因，再按 `available_indexes` 用合法的 `--indexes` 值重试；某个失败项的自身原因在 `errors[].detail`。逐项错误码仍由 MCP 侧生成：CLI 把逐项原因打包在媒体行的 `size` 字符串里，没有输出结构化的逐项错误码，这是值得上游到 CLI 的限制。`images` 不另写站点媒体提取流程。两个子命令只增强小红书，不改变其他 adapter。
+`--indexes`（逗号分隔；也可用可重复的 `--index`；两者都不传时返回全部图片）使用**原媒体序号**：序号取自 CLI 落盘文件名 `<note-id>_<n>` 中的 n，从 1 开始、覆盖整篇笔记下载到的全部媒体（含视频），既不依赖目录枚举顺序，也不按过滤后的纯图片列表重新编号；只有位于 `<note-id>/` 一级子目录、且文件名前缀与目录 ID 一致的文件参与映射，其余文件不参与，不做猜测式枚举。视频保留原序号但不作为图片返回。CLI 仍会先下载整篇媒体，`--indexes` 只限制读取与返回范围。`images` 子命令默认每次只返回 1 张图片块（ChatGPT connector 遇到多个 image 块时会丢弃整个结果，连文本一起消失；可用 `OPENCLI_XIAOHONGSHU_IMAGE_BLOCKS_PER_RESPONSE` 调到最多 20），其余请求到的索引放进 `skipped_indexes`，由调用方用 `--indexes` 分批取；单张最大 10 MiB、总计最大 20 MiB，字节超限项计入逐项错误。`images` 在 `status` 非 `success` 时也返回顶层 `error`（含 `code`、`message`，相关时带 `index` / `available_indexes` / `cli_error_code` / `exit_code` / `hint` / `stderr_tail`），并始终返回顶层 `available_indexes`（本次笔记磁盘上真实存在的 1 基媒体序号）；当下载产物只对应一个笔记 ID 时还返回顶层 `note_id`（公开笔记 ID，不是本地路径，xsec_token 与 cookies 仍不返回）。`errors[]` 每条都带人类可读的 `message`，相关时还带 `index`、`detail`（CLI 自己的逐项原因，如 "HTTP 403 Forbidden"）、`available_indexes`、`size_bytes`、`cli_error_code` 或 `exit_code`；错误码为 `IMAGE_DOWNLOAD_FAILED`（CLI 原因在 `detail` / `message`）、`IMAGE_NOT_FOUND`（`message` 列出可用序号）、`IMAGE_LIMIT`、`IMAGE_READ_FAILED`、`IMAGE_INDEX_UNMAPPABLE`、`IMAGE_INDEX_AMBIGUOUS`、`NO_IMAGES`、`CLI_ERROR`（`message` 为 CLI 的真实消息，如风控/安全拦截文本或 "No downloadable media found on this note."）、`TERMINATION_UNCONFIRMED` 与 `CLEANUP_PENDING`（清理类条目也带 `message`）。agent 应先读 `error.code` / `error.message` 定位原因，再按 `available_indexes` 用合法的 `--indexes` 值重试；某个失败项的自身原因在 `errors[].detail`。逐项错误码仍由 MCP 侧生成：CLI 把逐项原因打包在媒体行的 `size` 字符串里，没有输出结构化的逐项错误码，这是值得上游到 CLI 的限制。`images` 不另写站点媒体提取流程。两个子命令只增强小红书，不改变其他 adapter。
 
 ### 页面观察
 
@@ -492,6 +496,7 @@ hermes-default
 6. Hermes MCP client 会把 `boolean` 和 `object` 参数序列化为字符串；相关工具的 schema 已改为 `z.union([z.boolean(), z.string()])` 并在 handler 内强制转换，调用方无需关心。
 7. GitHub 等站点的 README 在 `<turbo-frame>` 内延迟加载；`browser_read` 的 `auto_scroll_retry` 默认能处理，但极慢的网络下可能需要调大 `timeout_ms`。
 8. 语义化压缩按行级特征分类（`content` / `chrome`）；对没有明确标签语义的纯文本流可能效果不明显。
+9. 两处已知重复逻辑暂未统一：手写 argv 解析（可用 `node:util.parseArgs` 替代，但需保留现有的非标准语义），以及失败消息优先级在 `src/opencli-runner.js` 与 `src/cli-failure.js` 各实现一次。
 
 ## 测试
 

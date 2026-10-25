@@ -9,6 +9,30 @@
 
 const SECRET_QUERY = /([?&](?:xsec_token|xsec_source|token|access_token|auth|key)=)[^&\s"']+/gi;
 
+// Chrome's Tabs API refuses a tab navigation with this text when the automation
+// tab was closed or replaced between lease resolution and tabs.update. OpenCLI
+// only recognises it inside the Google Images adapter, so everywhere else it
+// arrives as a bare message with no error code; a hint is what turns it into
+// something an agent can act on.
+const NAVIGATION_REJECTED = /navigation rejected/i;
+
+// The match is deliberately loose: this text is only used to attach prose and to
+// decide a single replay, and Chrome emits the sentence verbatim. A stricter
+// per-line match would miss the shapes the CLI actually forwards (a YAML block,
+// or stderr joined into one line), which would silently disable the retry.
+const NAVIGATION_REJECTED_HINT =
+  'This looks like Chrome refusing a tab navigation (a browser tab race, not platform risk control or a login problem). ' +
+  'Retrying usually succeeds; if it keeps failing, close the automation window so the next call opens a fresh tab.';
+
+// Accepts a thrown error (with the runner's details.stderr) or a plain string,
+// so the same test serves the failure summary and the media retry decision.
+export function isNavigationRejected(source) {
+  const text = typeof source === 'string'
+    ? source
+    : `${source?.message ?? ''} ${source?.details?.stderr ?? ''}`;
+  return NAVIGATION_REJECTED.test(text);
+}
+
 export function redactSecrets(value, secrets = []) {
   let text = String(value ?? '');
   for (const secret of secrets) {
@@ -69,6 +93,7 @@ function describeFailure({ code, message, hint, cliCode, stderr }, { secrets = [
     ? undefined
     : boundedText(typeof hint === 'string' ? hint : JSON.stringify(hint), { secrets, limit: 300 });
   if (safeHint) summary.hint = safeHint;
+  else if (isNavigationRejected(summary.message) || isNavigationRejected(tail)) summary.hint = NAVIGATION_REJECTED_HINT;
   // cli_error_code is the CLI's own code: its structured code when it emitted one
   // (for example XHS_NOTE_ERROR), otherwise the runner code (an exit code or a
   // semantic string such as TIMEOUT). exit_code exists only for a numeric one.

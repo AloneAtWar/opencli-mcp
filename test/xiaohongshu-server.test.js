@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile, rm } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -8,8 +8,9 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createServer } from "../src/server.js";
 import { OpenCliError } from "../src/opencli-runner.js";
 
-test("opencli_run advertises the effective media-cache limits", async () => {
-  const root = await mkdtemp(path.join(os.tmpdir(), "xhs-cache-description-"));
+test("opencli_status reports the effective media cache and the opt-in trace records tool names", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "xhs-status-"));
+  const trace = path.join(root, "calls.jsonl");
   const server = createServer({
     runOpenCli: async () => ({ data: "1.8.8" }),
     runnerOptions: {
@@ -17,10 +18,11 @@ test("opencli_run advertises the effective media-cache limits", async () => {
         OPENCLI_XIAOHONGSHU_DOWNLOAD_DIR: root,
         OPENCLI_XIAOHONGSHU_IMAGE_CACHE_MAX_FILES: "200",
         OPENCLI_XIAOHONGSHU_DOWNLOAD_CACHE_MAX_MB: "250",
+        OPENCLI_MCP_TRACE_CALLS: trace,
       },
     },
   });
-  const client = new Client({ name: "cache-description-test", version: "1.0" });
+  const client = new Client({ name: "status-test", version: "1.0" });
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   try {
     await server.connect(serverTransport);
@@ -31,16 +33,55 @@ test("opencli_run advertises the effective media-cache limits", async () => {
     assert.match(runDescription, /250000000-byte soft budget/);
     assert.match(runDescription, /OPENCLI_XIAOHONGSHU_IMAGE_CACHE_MAX_FILES=200/);
     assert.match(runDescription, /evicted FIFO by creation time/);
-    assert.match(tools.get("opencli_status").description, /media-cache limits/);
-
+    assert.match(runDescription, /1 image block\(s\) per response for this MCP process/);
+    assert.match(tools.get("opencli_status").description, /effective OpenCLI resolution, Xiaohongshu media-cache limits/);
     const status = await client.callTool({ name: "opencli_status", arguments: { doctor: false } });
     assert.equal(status.structuredContent.media_cache.image_cache_max_files, 200);
     assert.equal(status.structuredContent.media_cache.download_cache_max_mb, 250);
     assert.equal(status.structuredContent.media_cache.directory_source, "environment");
+
+    const secret = "TRACE_SECRET_123";
+    await client.callTool({ name: "opencli_run", arguments: { site: "example", command: "search", args: [secret] } });
+
+    const raw = await readFile(trace, "utf8");
+    const lines = raw.trim().split("\n").map((line) => JSON.parse(line));
+    assert.ok(lines.some((line) => line.tool === "opencli_status" && typeof line.ts === "string"));
+    assert.ok(lines.some((line) => line.tool === "opencli_run" && line.arg_names.includes("args")));
+    assert.equal(raw.includes(secret), false, "argument values never reach the trace");
   } finally {
     await client.close();
     await server.close();
     await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("opencli_adapter_list keeps the CLI-only array and still surfaces MCP-handled media subcommands", async () => {
+  const run = async () => ({
+    data: [{ site: "xiaohongshu", name: "download", command: "xiaohongshu/download", description: "下载小红书笔记中的图片和视频", domain: "www.xiaohongshu.com" }],
+  });
+  const server = createServer({ runOpenCli: run, runnerOptions: { env: {} } });
+  const client = new Client({ name: "catalog-test", version: "1.0" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  try {
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    const list = await client.callTool({ name: "opencli_adapter_list", arguments: { keywords: ["xiaohongshu"] } });
+    assert.deepEqual(list.structuredContent.value.map((entry) => entry.command), ["xiaohongshu/download"]);
+    const subcommands = list.structuredContent.mcp_handled_subcommands;
+    const images = subcommands.find((entry) => entry.command === "images");
+    assert.equal(images.tool, "opencli_run");
+    assert.equal(images.site, "xiaohongshu");
+    assert.equal(images.mcp_only, true);
+    assert.equal(images.cli_command, null);
+    const download = subcommands.find((entry) => entry.command === "download");
+    assert.equal(download.handled_by_mcp, true);
+    assert.equal(download.cli_command, "xiaohongshu/download");
+    const textBlocks = list.content.filter((block) => block.type === "text");
+    assert.equal(textBlocks.length, 2, "the CLI catalog and the MCP hint are separate text blocks");
+    assert.match(textBlocks[1].text, /mcp_handled_subcommands/);
+  } finally {
+    await client.close();
+    await server.close();
   }
 });
 

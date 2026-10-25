@@ -138,6 +138,7 @@ function runnerFor(plans, calls = []) {
     }
     if (plan.onCall) await plan.onCall(args);
     if (plan.block) await plan.block;
+    if (plan.throws) throw plan.throws;
     if (plan.fail === "timeout") {
       throw new OpenCliError("OpenCLI timed out after 90000ms", { code: "TIMEOUT", command: "opencli", args });
     }
@@ -174,6 +175,14 @@ function makeMedia(plans, { env = {}, cwd, calls = [] } = {}) {
   // and write into the real user Downloads folder.
   const mergedEnv = cwd === undefined ? { ...env } : { OPENCLI_XIAOHONGSHU_DOWNLOAD_DIR: cwd, ...env };
   return { media: createXiaohongshuMedia({ run: runnerFor(plans, calls), env: mergedEnv, cwd }), calls };
+}
+
+function navigationRejected() {
+  return new OpenCliError("Navigation rejected.", { code: 1, stdout: "", stderr: "Navigation rejected." });
+}
+
+function timeoutMentioningNavigation() {
+  return new OpenCliError("OpenCLI timed out after 90000ms", { code: "TIMEOUT", stdout: "", stderr: "Navigation rejected." });
 }
 
 function imageBlocks(result) {
@@ -461,7 +470,7 @@ test("images() keeps the total payload within the 20 MiB budget", async () => {
           ],
         },
       ],
-      { env: {}, cwd: root },
+      { env: { OPENCLI_XIAOHONGSHU_IMAGE_BLOCKS_PER_RESPONSE: "20" }, cwd: root },
     );
 
     const result = await media.images({ note_url: "https://xhslink.com/a" });
@@ -471,6 +480,60 @@ test("images() keeps the total payload within the 20 MiB budget", async () => {
     assert.ok(total <= 20 * MIB, `total payload ${total} exceeded the 20 MiB budget`);
     assert.equal(blocks.length, 2);
     assert.ok(result.structuredContent.errors.length >= 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("images() returns one image block by default and pages the rest through skipped_indexes", async () => {
+  const root = await tempRoot();
+  try {
+    const files = Array.from({ length: 21 }, (_, offset) => ({ name: `abc_${offset + 1}.jpg`, bytes: JPEG }));
+    const { media } = makeMedia([{ noteId: "abc", files }], { env: {}, cwd: root });
+
+    const result = await media.images({ note_url: "https://xhslink.com/a" });
+
+    assert.equal(imageBlocks(result).length, 1, "the default per-response image-block budget is one");
+    assert.equal(result.structuredContent.image_blocks_per_response, 1);
+    assert.equal(result.structuredContent.status, "success");
+    assert.deepEqual(result.structuredContent.available_indexes, Array.from({ length: 21 }, (_, offset) => offset + 1));
+    assert.deepEqual(result.structuredContent.skipped_indexes, Array.from({ length: 20 }, (_, offset) => offset + 2));
+    assert.equal(result.structuredContent.errors.length, 0);
+    assert.equal(result.structuredContent.error, undefined);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("images() pages everything past a raised budget of 20", async () => {
+  const root = await tempRoot();
+  try {
+    const files = Array.from({ length: 21 }, (_, offset) => ({ name: `abc_${offset + 1}.jpg`, bytes: JPEG }));
+    const { media } = makeMedia([{ noteId: "abc", files }], { env: { OPENCLI_XIAOHONGSHU_IMAGE_BLOCKS_PER_RESPONSE: "20" }, cwd: root });
+
+    const result = await media.images({ note_url: "https://xhslink.com/a" });
+
+    assert.equal(imageBlocks(result).length, 20);
+    assert.deepEqual(result.structuredContent.skipped_indexes, [21], "everything past the hard cap is paged, not an error");
+    assert.equal(result.structuredContent.status, "success");
+    assert.equal(result.structuredContent.errors.length, 0);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("images() pages explicitly requested indexes too", async () => {
+  const root = await tempRoot();
+  try {
+    const files = Array.from({ length: 3 }, (_, offset) => ({ name: `abc_${offset + 1}.jpg`, bytes: JPEG }));
+    const { media } = makeMedia([{ noteId: "abc", files }], { env: {}, cwd: root });
+
+    const result = await media.images({ note_url: "https://xhslink.com/a", image_indexes: [2, 3] });
+
+    assert.equal(imageBlocks(result).length, 1);
+    assert.deepEqual(result.structuredContent.images.map((image) => image.index), [2]);
+    assert.deepEqual(result.structuredContent.skipped_indexes, [3]);
+    assert.equal(result.structuredContent.status, "success");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -630,6 +693,178 @@ test("runDownload() routes Xiaohongshu download through the managed cache", asyn
     assert.equal(args[0], "xiaohongshu");
     assert.equal(args[1], "download");
     assert.ok(outputDirOf(args).startsWith(path.resolve(root) + path.sep));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a Navigation rejected download is replayed once on a separate browser session", async () => {
+  const root = await tempRoot();
+  try {
+    const calls = [];
+    const { media } = makeMedia(
+      [
+        { noteId: "n1", files: [{ name: "n1_stale.jpg", bytes: JPEG }], throws: navigationRejected() },
+        { noteId: "n1", files: [{ name: "n1_1.jpg", bytes: JPEG }] },
+      ],
+      { env: { OPENCLI_XIAOHONGSHU_DOWNLOAD_DIR: root }, cwd: root, calls },
+    );
+
+    const result = await media.download({ note_url: "https://xhslink.com/a", timeout_ms: 1000 });
+
+    assert.equal(result.structuredContent.status, "success");
+    assert.deepEqual(result.structuredContent.retry, {
+      reason: "navigation_rejected",
+      attempts: 2,
+      session: "persistent",
+      outcome: "success",
+    });
+    assert.equal(calls.length, 2);
+    assert.equal(calls[0].options.env, undefined, "the first attempt keeps the process environment");
+    assert.deepEqual(calls[1].options.env, { OPENCLI_SITE_SESSION: "persistent" });
+    assert.deepEqual(
+      result.structuredContent.files.map((file) => path.basename(file.local_path)),
+      ["n1_1.jpg"],
+      "the replay starts from a clean request directory, so the first attempt cannot leak files",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("an explicitly persistent run is retried on an ephemeral session", async () => {
+  const root = await tempRoot();
+  try {
+    const calls = [];
+    const { media } = makeMedia(
+      [
+        { noteId: "n1", files: [], throws: navigationRejected() },
+        { noteId: "n1", files: [{ name: "n1_1.jpg", bytes: JPEG }] },
+      ],
+      { env: { OPENCLI_XIAOHONGSHU_DOWNLOAD_DIR: root, OPENCLI_SITE_SESSION: "persistent" }, cwd: root, calls },
+    );
+
+    const result = await media.download({ note_url: "https://xhslink.com/a", timeout_ms: 1000 });
+
+    assert.equal(result.structuredContent.retry.session, "ephemeral");
+    assert.deepEqual(calls[1].options.env, { OPENCLI_SITE_SESSION: "ephemeral" });
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a repeated Navigation rejected failure is reported with a retry record and a hint", async () => {
+  const root = await tempRoot();
+  try {
+    const calls = [];
+    const { media } = makeMedia(
+      [
+        { noteId: "n1", files: [], throws: navigationRejected() },
+        { noteId: "n1", files: [], throws: navigationRejected() },
+      ],
+      { env: { OPENCLI_XIAOHONGSHU_DOWNLOAD_DIR: root }, cwd: root, calls },
+    );
+
+    const result = await media.download({ note_url: "https://xhslink.com/a", timeout_ms: 1000 });
+
+    assert.equal(result.structuredContent.status, "error");
+    assert.equal(result.structuredContent.error.code, "CLI_ERROR");
+    assert.equal(result.structuredContent.error.message, "Navigation rejected.");
+    assert.match(result.structuredContent.error.hint, /tab navigation/i);
+    assert.equal(result.structuredContent.retry.outcome, "failed");
+    assert.equal(calls.length, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a replay that still reports per-media failures is not recorded as a success", async () => {
+  const root = await tempRoot();
+  try {
+    const calls = [];
+    const { media } = makeMedia(
+      [
+        { noteId: "n1", files: [], throws: navigationRejected() },
+        {
+          noteId: "n1",
+          files: [{ name: "n1_1.jpg", bytes: JPEG }],
+          cliData: [
+            { index: 1, type: "image", status: "success", size: `${JPEG.length} B` },
+            { index: 2, type: "image", status: "error", size: "HTTP 403 Forbidden" },
+          ],
+        },
+      ],
+      { env: { OPENCLI_XIAOHONGSHU_DOWNLOAD_DIR: root }, cwd: root, calls },
+    );
+
+    const result = await media.download({ note_url: "https://xhslink.com/a", timeout_ms: 1000 });
+
+    assert.equal(result.structuredContent.status, "partial");
+    assert.equal(result.structuredContent.retry.outcome, "partial", "outcome follows the media verdict, not the exit code");
+    assert.equal(calls.length, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a replay that itself times out is recorded as failed and stays unconfirmed", async () => {
+  const root = await tempRoot();
+  try {
+    const calls = [];
+    const { media } = makeMedia(
+      [
+        { noteId: "n1", files: [], throws: navigationRejected() },
+        { noteId: "n1", files: [{ name: "n1_1.jpg", bytes: JPEG }], throws: timeoutMentioningNavigation() },
+      ],
+      { env: { OPENCLI_XIAOHONGSHU_DOWNLOAD_DIR: root }, cwd: root, calls },
+    );
+
+    const result = await media.download({ note_url: "https://xhslink.com/a", timeout_ms: 1000 });
+
+    assert.equal(result.structuredContent.retry.outcome, "failed");
+    assert.equal(result.structuredContent.inventory_complete, false);
+    assert.deepEqual(result.structuredContent.files, [], "an unconfirmed replay is never inventoried");
+    assert.equal(calls.length, 2);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("an unrelated CLI failure is not replayed", async () => {
+  const root = await tempRoot();
+  try {
+    const calls = [];
+    const { media } = makeMedia(
+      [{ noteId: "n1", files: [], fail: true }],
+      { env: { OPENCLI_XIAOHONGSHU_DOWNLOAD_DIR: root }, cwd: root, calls },
+    );
+
+    const result = await media.download({ note_url: "https://xhslink.com/a", timeout_ms: 1000 });
+
+    assert.equal(result.structuredContent.status, "error");
+    assert.equal(result.structuredContent.retry, undefined);
+    assert.equal(calls.length, 1);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("a timed-out run is never replayed even when its stderr mentions a rejected navigation", async () => {
+  const root = await tempRoot();
+  try {
+    const calls = [];
+    const { media } = makeMedia(
+      [{ noteId: "n1", files: [{ name: "n1_1.jpg", bytes: JPEG }], throws: timeoutMentioningNavigation() }],
+      { env: { OPENCLI_XIAOHONGSHU_DOWNLOAD_DIR: root }, cwd: root, calls },
+    );
+
+    const result = await media.download({ note_url: "https://xhslink.com/a", timeout_ms: 1000 });
+
+    assert.equal(calls.length, 1, "a run we stopped must never be replayed");
+    assert.equal(result.structuredContent.retry, undefined);
+    assert.equal(result.structuredContent.inventory_complete, false);
+    assert.equal(result.structuredContent.status, "error");
+    assert.deepEqual(result.structuredContent.files, [], "an unconfirmed writer keeps its directory out of the inventory");
   } finally {
     await rm(root, { recursive: true, force: true });
   }
@@ -1011,7 +1246,7 @@ test("runImages() parses argv, keeps signed URLs intact, and answers --help with
     const calls = [];
     const { media } = makeMedia(
       [{ noteId: "abc123", files: [{ name: "abc123_1.jpg", bytes: JPEG }, { name: "abc123_3.png", bytes: PNG }], cliData: [] }],
-      { env: {}, cwd: root, calls },
+      { env: { OPENCLI_XIAOHONGSHU_IMAGE_BLOCKS_PER_RESPONSE: "20" }, cwd: root, calls },
     );
 
     const help = await media.runImages(["--help"]);
@@ -1190,6 +1425,34 @@ test("failure text keeps server-local paths while the signed token stays redacte
     );
     assert.ok(!failed.detail.includes(token), "the signed token is still redacted");
     assert.ok(!images.structuredContent.error.message.includes(token));
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test("runImages() reports the navigation retry in its own payload", async () => {
+  const root = await tempRoot();
+  try {
+    const calls = [];
+    const { media } = makeMedia(
+      [
+        { noteId: "n1", files: [], throws: navigationRejected() },
+        { noteId: "n1", files: [{ name: "n1_1.jpg", bytes: PNG }] },
+      ],
+      { env: { OPENCLI_XIAOHONGSHU_DOWNLOAD_DIR: root }, cwd: root, calls },
+    );
+
+    const result = await media.runImages(["https://xhslink.com/a", "--indexes", "1"]);
+
+    assert.equal(result.structuredContent.status, "success");
+    assert.deepEqual(result.structuredContent.retry, {
+      reason: "navigation_rejected",
+      attempts: 2,
+      session: "persistent",
+      outcome: "success",
+    });
+    assert.equal(imageBlocks(result).length, 1);
+    assert.equal(calls.length, 2);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

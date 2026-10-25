@@ -6,7 +6,7 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { boundedTail, redactSecrets, summarizeCliResult, summarizeFailure } from "../src/cli-failure.js";
+import { boundedTail, isNavigationRejected, redactSecrets, summarizeCliResult, summarizeFailure } from "../src/cli-failure.js";
 import { OpenCliError } from "../src/opencli-runner.js";
 
 test("a long stderr dump keeps its final actionable line", () => {
@@ -90,4 +90,34 @@ test("summarizeCliResult reads both the flat media shape and a runner-shaped res
   assert.equal(structured.cli_error_code, "PARTIAL_MEDIA");
   assert.equal(structured.exit_code, 4);
   assert.equal(structured.message, "two media items failed");
+});
+
+test("a Navigation rejected failure carries an actionable hint", () => {
+  const error = new OpenCliError("Navigation rejected.", { code: 1, stdout: "", stderr: "Navigation rejected." });
+
+  const summary = summarizeFailure(error);
+
+  assert.equal(summary.message, "Navigation rejected.");
+  assert.equal(summary.exit_code, 1);
+  assert.match(summary.hint, /tab navigation/i);
+  assert.match(summary.hint, /retry/i);
+});
+
+test("a hint from the CLI wins over the Navigation rejected hint", () => {
+  const error = new OpenCliError("OpenCLI exited with code 2", {
+    code: 2,
+    stdout: "",
+    stderr: "Navigation rejected.",
+    data: { error: { code: "XHS_NAV", message: "Navigation rejected.", hint: "close the automation window first" } },
+  });
+
+  const summary = summarizeFailure(error);
+
+  assert.equal(summary.hint, "close the automation window first");
+});
+
+test("isNavigationRejected reads a thrown error or a raw string", () => {
+  assert.equal(isNavigationRejected(new OpenCliError("boom", { stderr: "Navigation rejected." })), true);
+  assert.equal(isNavigationRejected("opencli: Navigation rejected."), true);
+  assert.equal(isNavigationRejected(new Error("exited with code 1")), false);
 });

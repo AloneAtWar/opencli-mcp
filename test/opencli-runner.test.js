@@ -58,6 +58,43 @@ test("runner passes arguments without a shell", async () => {
   assert.equal(result.stderr, "");
 });
 
+test("a per-call env overrides the runner environment for that invocation only", async () => {
+  const run = createOpenCliRunner({
+    resolved: {
+      command: process.execPath,
+      prefixArgs: ["-e", "process.stdout.write(JSON.stringify({ session: process.env.OPENCLI_SITE_SESSION ?? null, hasPath: Boolean(process.env.PATH || process.env.Path) }))"],
+      source: "test fixture",
+    },
+    env: { ...process.env, OPENCLI_SITE_SESSION: "process-default" },
+  });
+
+  const first = await run(["noop"]);
+  assert.equal(first.data.session, "process-default");
+
+  const overridden = await run(["noop"], { env: { OPENCLI_SITE_SESSION: "per-call" } });
+  assert.equal(overridden.data.session, "per-call");
+  assert.equal(overridden.data.hasPath, true, "a per-call override merges into the runner env");
+
+  const last = await run(["noop"]);
+  assert.equal(last.data.session, "process-default", "the runner environment is not mutated");
+});
+
+test("a Windows per-call override replaces the same key regardless of casing", { skip: process.platform !== "win32" }, async () => {
+  const run = createOpenCliRunner({
+    resolved: {
+      command: process.execPath,
+      prefixArgs: ["-e", "process.stdout.write(JSON.stringify({ keys: Object.keys(process.env).filter(k => k.toLowerCase() === 'opencli_case_probe'), value: process.env.OPENCLI_CASE_PROBE ?? null }))"],
+      source: "test fixture",
+    },
+    env: { ...process.env, OPENCLI_CASE_PROBE: "base" },
+  });
+
+  const result = await run(["noop"], { env: { opencli_case_probe: "override" } });
+
+  assert.equal(result.data.value, "override");
+  assert.equal(result.data.keys.length, 1, "Windows must not receive both casings of the same key");
+});
+
 test("runner returns structured process errors", async () => {
   const run = createOpenCliRunner({
     resolved: {

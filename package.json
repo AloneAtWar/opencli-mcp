@@ -26,7 +26,7 @@
     "test:http-flow": "node scripts/http-flow-smoke.js",
     "test:http-advanced": "node scripts/http-advanced-smoke.js",
     "test:xhs-live": "node scripts/xiaohongshu-live-smoke.js",
-    "check": "node --check src/server.js && node --check src/xiaohongshu-media.js && node --check src/browser-flow.js && node --check src/browser-advanced.js && node --check src/browser-diagnostics.js && node --check src/http-server.js && node --check src/commands.js && node --check src/opencli-runner.js"
+    "check": "node --check src/server.js && node --check src/site-gate.js && node --check src/xiaohongshu-media.js && node --check src/browser-flow.js && node --check src/browser-advanced.js && node --check src/browser-diagnostics.js && node --check src/http-server.js && node --check src/commands.js && node --check src/opencli-runner.js"
   },
   "engines": {
     "node": ">=20"
