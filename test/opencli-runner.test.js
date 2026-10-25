@@ -1,6 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -62,6 +70,193 @@ test("runner returns structured process errors", async () => {
     run(["bad"]),
     (error) => error instanceof OpenCliError && error.details.code === 7,
   );
+});
+
+// --- termination lifecycle: stop the whole tree, confirm it, keep partial data ---
+
+// Spawns a grandchild that inherits the stdout pipe and lingers ~3s. A parent-only
+// kill leaves that grandchild holding the pipe, so 'close' would not fire promptly.
+const HOLD_STDOUT_PIPE_SCRIPT = [
+  'const { spawn } = require("node:child_process");',
+  'spawn(process.execPath, ["-e", "setTimeout(() => {}, 3000)"], { stdio: "inherit" });',
+  "setInterval(() => {}, 1000);",
+].join(" ");
+
+const PARTIAL_THEN_SPAM_SCRIPT = [
+  'process.stdout.write("DOWNLOADED:note-123;");',
+  "setTimeout(() => {",
+  '  const chunk = "x".repeat(4096);',
+  "  setInterval(() => process.stdout.write(chunk), 2);",
+  "}, 30);",
+].join(" ");
+
+test("timeout stops the whole process tree before rejecting", async () => {
+  const run = createOpenCliRunner({
+    resolved: {
+      command: process.execPath,
+      prefixArgs: ["-e", HOLD_STDOUT_PIPE_SCRIPT],
+      source: "test fixture",
+    },
+    timeoutMs: 150,
+    killGraceMs: 100,
+    killDeadlineMs: 2_000,
+  });
+
+  const startedAt = Date.now();
+  await assert.rejects(run([]), (error) => {
+    assert.ok(error instanceof OpenCliError);
+    assert.equal(error.details.code, "TIMEOUT");
+    assert.equal(error.details.termination_confirmed, true);
+    // exit_code/signal are only known once the child actually closed.
+    assert.equal("exit_code" in error.details, true);
+    assert.equal("signal" in error.details, true);
+    return true;
+  });
+
+  // A parent-only kill would wait ~3s on the orphaned grandchild's pipe.
+  assert.ok(Date.now() - startedAt < 2_000, "runner waited on an orphaned grandchild");
+});
+
+test("output limit rejects after close and preserves partial stdout", async () => {
+  const run = createOpenCliRunner({
+    resolved: {
+      command: process.execPath,
+      prefixArgs: ["-e", PARTIAL_THEN_SPAM_SCRIPT],
+      source: "test fixture",
+    },
+    maxOutputBytes: 1_024,
+    timeoutMs: 5_000,
+    killGraceMs: 100,
+    killDeadlineMs: 2_000,
+  });
+
+  await assert.rejects(run([]), (error) => {
+    assert.ok(error instanceof OpenCliError);
+    assert.equal(error.details.code, "OUTPUT_LIMIT");
+    assert.equal(error.details.partial, true);
+    assert.equal(error.details.termination_confirmed, true);
+    assert.equal(error.details.stdout.startsWith("DOWNLOADED:note-123;"), true);
+    return true;
+  });
+});
+
+test("termination_confirmed stays false when a tree stop cannot be proven", async () => {
+  const run = createOpenCliRunner({
+    resolved: {
+      command: process.execPath,
+      prefixArgs: ["-e", "setInterval(() => {}, 1000);"],
+      source: "test fixture",
+    },
+    timeoutMs: 120,
+    killGraceMs: 60,
+    killDeadlineMs: 1_500,
+    killTree: () => "failed",
+  });
+
+  await assert.rejects(run([]), (error) => {
+    assert.equal(error.details.code, "TIMEOUT");
+    assert.equal(error.details.termination_confirmed, false);
+    return true;
+  });
+});
+
+// POSIX only: a descendant that ignores SIGTERM and redirected its stdio keeps
+// writing after the parent closes. Confirmation must force-kill the group.
+// (Descendants that leave the group via setsid/detached are out of scope.)
+function ignoreTermWriterScript(file) {
+  const grandchild = [
+    'process.on("SIGTERM", () => {});',
+    'const fs = require("node:fs");',
+    `const fd = fs.openSync(${JSON.stringify(file)}, "a");`,
+    'setInterval(() => fs.writeSync(fd, "tick"), 40);',
+  ].join("");
+  return [
+    'const { spawn } = require("node:child_process");',
+    'const fs = require("node:fs");',
+    `const out = fs.openSync(${JSON.stringify(file)}, "a");`,
+    `spawn(process.execPath, ["-e", ${JSON.stringify(grandchild)}], { stdio: ["ignore", out, out] }).unref();`,
+    "setInterval(() => {}, 1000);",
+  ].join("");
+}
+
+test(
+  "a SIGTERM-ignoring descendant keeps the stop unconfirmed until it is killed",
+  { skip: process.platform === "win32" },
+  async () => {
+    const dir = makeTempRoot();
+    const marker = path.join(dir, "ticks.txt");
+    try {
+      const run = createOpenCliRunner({
+        resolved: {
+          command: process.execPath,
+          prefixArgs: ["-e", ignoreTermWriterScript(marker)],
+          source: "test fixture",
+        },
+        timeoutMs: 200,
+        killGraceMs: 120,
+        killDeadlineMs: 2_000,
+      });
+
+      await assert.rejects(run([]), (error) => {
+        assert.equal(error.details.code, "TIMEOUT");
+        assert.equal(error.details.termination_confirmed, true);
+        return true;
+      });
+
+      assert.equal(existsSync(marker), true, "descendant never wrote before the stop");
+      const sizeAfterStop = statSync(marker).size;
+      await new Promise((resolve) => setTimeout(resolve, 400));
+      assert.equal(
+        statSync(marker).size,
+        sizeAfterStop,
+        "descendant kept writing after a confirmed stop",
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  },
+);
+
+test("runner falls back to options.cwd and still honors a per-call cwd", async () => {
+  const baseDir = makeTempRoot();
+  const callDir = makeTempRoot();
+  try {
+    const run = createOpenCliRunner({
+      resolved: {
+        command: process.execPath,
+        prefixArgs: ["-e", "process.stdout.write(process.cwd())"],
+        source: "test fixture",
+      },
+      cwd: baseDir,
+    });
+
+    const fallback = await run([]);
+    assert.equal(realpathSync(fallback.stdout.trim()), realpathSync(baseDir));
+
+    const overridden = await run([], { cwd: callDir });
+    assert.equal(realpathSync(overridden.stdout.trim()), realpathSync(callDir));
+  } finally {
+    rmSync(baseDir, { recursive: true, force: true });
+    rmSync(callDir, { recursive: true, force: true });
+  }
+});
+
+test("runner exposes a non-enumerable executionPlatform hint", () => {
+  const native = createOpenCliRunner({
+    resolved: { command: process.execPath, prefixArgs: [], source: "test" },
+  });
+  assert.equal(native.executionPlatform, process.platform);
+  assert.equal(Object.keys(native).includes("executionPlatform"), false);
+
+  // A mounted Windows node.exe (WSL -> Windows) must report win32, not the host OS.
+  const crossOs = createOpenCliRunner({
+    resolved: {
+      command: "C:\\Users\\dev\\AppData\\Roaming\\fnm\\node-versions\\v20.11.0\\installation\\node.exe",
+      prefixArgs: [],
+      source: "WSL -> Windows Node",
+    },
+  });
+  assert.equal(crossOs.executionPlatform, "win32");
 });
 
 // --- P0: npm global / PATH auto-discovery ---

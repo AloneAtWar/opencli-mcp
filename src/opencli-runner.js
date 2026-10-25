@@ -1,14 +1,24 @@
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 const DEFAULT_TIMEOUT_MS = 90_000;
 const DEFAULT_MAX_OUTPUT_BYTES = 32 * 1024 * 1024;
+// Grace period between the soft stop signal and the forced process-tree kill.
+const DEFAULT_KILL_GRACE_MS = 2_000;
+// Hard ceiling for observing closure before the runner gives up and reports an
+// unconfirmed stop. Kept above the grace period so SIGKILL has time to land.
+const DEFAULT_KILL_DEADLINE_MS = 5_000;
+// Bound for `taskkill` and for polling a POSIX process group until it is empty.
+const TASKKILL_TIMEOUT_MS = 5_000;
+const TREE_PROBE_TIMEOUT_MS = 750;
+const TREE_PROBE_INTERVAL_MS = 25;
 const CONFIG_FILE_NAME = ".opencli-mcp.json";
 const OPENCLI_PACKAGE = ["@jackwener", "opencli"];
 const JS_EXTENSIONS = [".js", ".mjs", ".cjs"];
 const SHELL_SHIM_EXTENSIONS = [".ps1", ".cmd", ".bat"];
+const WINDOWS_EXECUTABLE = /\.exe$/i;
 
 export class OpenCliResolutionError extends Error {
   constructor(message, candidates = []) {
@@ -453,12 +463,59 @@ function spawnHint(error) {
   return "";
 }
 
+/**
+ * Decide which OS the resolved CLI executable really runs on. Auto-discovery can
+ * point WSL at a mounted Windows `node.exe`, where process.platform would report
+ * "linux" even though the child is a Windows binary that writes Windows paths.
+ */
+function resolveExecutionPlatform(command, fallback = process.platform) {
+  if (typeof command === "string" && WINDOWS_EXECUTABLE.test(command.trim())) return "win32";
+  return fallback;
+}
+
 export function createOpenCliRunner(options = {}) {
   const resolved = options.resolved ?? resolveOpenCli(options.env ?? process.env);
   const timeoutMs = options.timeoutMs ?? Number(process.env.OPENCLI_MCP_TIMEOUT_MS || DEFAULT_TIMEOUT_MS);
   const maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
+  const killGraceMs = options.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
+  const killDeadlineMs = options.killDeadlineMs ?? Math.max(DEFAULT_KILL_DEADLINE_MS, killGraceMs + 1_000);
+  const isWindowsHost = process.platform === "win32";
 
-  return async function runOpenCli(args, callOptions = {}) {
+  // Terminate the whole process tree, not just the direct child: OpenCLI can shell
+  // out to yt-dlp and other workers that keep writing after the parent is gone.
+  // Returns "stopped" (tree-wide signal accepted), "gone" (nothing left to stop)
+  // or "failed", so an already-exited child is never confused with a stopped tree.
+  const defaultKillTree = (child, signal) => {
+    if (!child.pid) return "failed";
+    if (isWindowsHost) {
+      try {
+        const result = spawnSync(
+          "taskkill",
+          ["/pid", String(child.pid), "/T", "/F"],
+          {
+            windowsHide: true,
+            stdio: "ignore",
+            timeout: TASKKILL_TIMEOUT_MS,
+            killSignal: "SIGKILL",
+          },
+        );
+        // Only taskkill /T /F exiting 0 proves the Windows tree was terminated.
+        return Boolean(result) && result.status === 0 ? "stopped" : "failed";
+      } catch {
+        return "failed";
+      }
+    }
+    try {
+      // POSIX children are spawned detached (own process group) so -pid targets the tree.
+      process.kill(-child.pid, signal);
+      return "stopped";
+    } catch (error) {
+      return error?.code === "ESRCH" ? "gone" : "failed";
+    }
+  };
+  const killTree = options.killTree ?? defaultKillTree;
+
+  const runOpenCli = async function runOpenCli(args, callOptions = {}) {
     if (!Array.isArray(args) || args.some((arg) => typeof arg !== "string")) {
       throw new TypeError("OpenCLI arguments must be a string array");
     }
@@ -472,7 +529,8 @@ export function createOpenCliRunner(options = {}) {
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
         env: options.env ?? process.env,
-        cwd: callOptions.cwd,
+        cwd: callOptions.cwd ?? options.cwd,
+        detached: !isWindowsHost,
       });
 
       const stdoutChunks = [];
@@ -480,35 +538,166 @@ export function createOpenCliRunner(options = {}) {
       let stdoutBytes = 0;
       let stderrBytes = 0;
       let settled = false;
+      let termination = null;
+      let treeStopAccepted = false;
+      let timeoutTimer = null;
+      const killTimers = new Set();
 
-      const timer = setTimeout(() => {
+      const clearKillTimers = () => {
+        for (const pending of killTimers) clearTimeout(pending);
+        killTimers.clear();
+      };
+
+      const settle = (finish) => {
         if (settled) return;
-        child.kill();
         settled = true;
-        reject(
-          new OpenCliError(`OpenCLI timed out after ${effectiveTimeout}ms`, {
+        if (timeoutTimer) clearTimeout(timeoutTimer);
+        clearKillTimers();
+        finish();
+      };
+
+      const snapshot = () => {
+        const stdout = Buffer.concat(stdoutChunks).toString("utf8");
+        const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
+        return { stdout, stderr, data: parseOpenCliOutput(stdout) };
+      };
+
+      // Termination errors keep the partial capture so the caller can still
+      // inventory whatever was written before the stop.
+      const terminationError = (info = {}) => {
+        const partial = snapshot();
+        return new OpenCliError(termination.message, {
+          ok: false,
+          partial: true,
+          code: termination.code,
+          signal: info.signal ?? null,
+          exit_code: info.code ?? null,
+          termination_confirmed: info.confirmed === true,
+          stdout: partial.stdout,
+          stderr: partial.stderr,
+          data: partial.data,
+          invocation: {
             command: resolved.command,
             args: finalArgs,
-            code: "TIMEOUT",
-          }),
+            source: resolved.source,
+          },
+        });
+      };
+
+      const safeKill = (signal) => {
+        try {
+          child.kill(signal);
+          return true;
+        } catch {
+          return false;
+        }
+      };
+
+      const softStopTree = () => {
+        if (isWindowsHost) return;
+        // Windows has no graceful tree signal; POSIX gets SIGTERM to the group first.
+        if (killTree(child, "SIGTERM") === "failed") safeKill("SIGTERM");
+      };
+
+      const forceStopTree = () => {
+        if (settled) return;
+        const outcome = killTree(child, "SIGKILL");
+        if (outcome === "stopped" || outcome === "gone") {
+          treeStopAccepted = true;
+          return;
+        }
+        safeKill("SIGKILL");
+      };
+
+      // A direct-child close only proves the parent stopped. Force SIGKILL across
+      // the whole group even when the parent exits early, then wait until the
+      // group is empty (POSIX), so a SIGTERM-ignoring descendant that redirected
+      // its stdio can never be mistaken for a confirmed stop.
+      const confirmTreeStopped = () =>
+        new Promise((resolve) => {
+          if (settled) {
+            resolve(false);
+            return;
+          }
+
+          if (isWindowsHost) {
+            // Reuse an already accepted taskkill /T /F stop: re-running it against
+            // the now-dead pid reports "not found" (non-zero) and is no proof either way.
+            resolve(treeStopAccepted || killTree(child, "SIGKILL") === "stopped");
+            return;
+          }
+
+          const outcome = killTree(child, "SIGKILL");
+          // "gone" means the whole group is already empty.
+          if (outcome === "gone") return resolve(true);
+          if (outcome !== "stopped") {
+            resolve(false);
+            return;
+          }
+          if (!child.pid) {
+            resolve(false);
+            return;
+          }
+          const deadline = Date.now() + TREE_PROBE_TIMEOUT_MS;
+          const probe = () => {
+            let gone = false;
+            try {
+              process.kill(-child.pid, 0);
+            } catch (error) {
+              if (error?.code !== "ESRCH") {
+                resolve(false);
+                return;
+              }
+              gone = true;
+            }
+            if (gone) {
+              resolve(true);
+              return;
+            }
+            if (settled || Date.now() >= deadline) {
+              resolve(false);
+              return;
+            }
+            killTimers.add(setTimeout(probe, TREE_PROBE_INTERVAL_MS));
+          };
+          probe();
+        });
+
+      const requestTermination = (code, message) => {
+        if (settled || termination) return;
+        termination = { code, message };
+        if (timeoutTimer) {
+          clearTimeout(timeoutTimer);
+          timeoutTimer = null;
+        }
+
+        if (isWindowsHost) {
+          forceStopTree();
+        } else {
+          softStopTree();
+          killTimers.add(setTimeout(forceStopTree, killGraceMs));
+        }
+        // Absolute ceiling: if closure is never observed, report an unconfirmed
+        // stop instead of hanging, so callers keep the directory and verify later.
+        killTimers.add(
+          setTimeout(() => {
+            // Closure was never observed, so the stop stays unconfirmed even
+            // after this last best-effort escalation.
+            killTree(child, "SIGKILL");
+            settle(() => reject(terminationError({ confirmed: false })));
+          }, killDeadlineMs),
         );
+      };
+
+      timeoutTimer = setTimeout(() => {
+        requestTermination("TIMEOUT", `OpenCLI timed out after ${effectiveTimeout}ms`);
       }, effectiveTimeout);
 
       const collect = (chunks, kind) => (chunk) => {
+        if (settled || termination) return;
         const nextBytes = kind === "stdout" ? stdoutBytes + chunk.length : stderrBytes + chunk.length;
         if (nextBytes > maxOutputBytes) {
-          child.kill();
-          if (!settled) {
-            settled = true;
-            clearTimeout(timer);
-            reject(
-              new OpenCliError(`OpenCLI ${kind} exceeded ${maxOutputBytes} bytes`, {
-                command: resolved.command,
-                args: finalArgs,
-                code: "OUTPUT_LIMIT",
-              }),
-            );
-          }
+          requestTermination("OUTPUT_LIMIT", `OpenCLI ${kind} exceeded ${maxOutputBytes} bytes`);
           return;
         }
         if (kind === "stdout") stdoutBytes = nextBytes;
@@ -521,32 +710,40 @@ export function createOpenCliRunner(options = {}) {
 
       child.on("error", (error) => {
         if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        reject(
-          new OpenCliError(`Failed to start OpenCLI (${resolved.command}): ${error.message}${spawnHint(error)}`, {
-            command: resolved.command,
-            args: finalArgs,
-            code: "SPAWN_ERROR",
-          }),
+        if (termination) {
+          settle(() => reject(terminationError({ confirmed: treeStopAccepted })));
+          return;
+        }
+        settle(() =>
+          reject(
+            new OpenCliError(`Failed to start OpenCLI (${resolved.command}): ${error.message}${spawnHint(error)}`, {
+              command: resolved.command,
+              args: finalArgs,
+              code: "SPAWN_ERROR",
+            }),
+          ),
         );
       });
 
       child.on("close", (code, signal) => {
         if (settled) return;
-        settled = true;
-        clearTimeout(timer);
+        if (termination) {
+          // Only a confirmed whole-tree stop is safe for directory inventory and
+          // cleanup; that confirmation is the completion signal callers await.
+          confirmTreeStopped().then((confirmed) => {
+            settle(() => reject(terminationError({ code, signal, confirmed })));
+          });
+          return;
+        }
 
-        const stdout = Buffer.concat(stdoutChunks).toString("utf8");
-        const stderr = Buffer.concat(stderrChunks).toString("utf8").trim();
-        const parsed = parseOpenCliOutput(stdout);
+        const partial = snapshot();
         const result = {
           ok: code === 0,
           code,
           signal,
-          stdout,
-          stderr,
-          data: parsed,
+          stdout: partial.stdout,
+          stderr: partial.stderr,
+          data: partial.data,
           invocation: {
             command: resolved.command,
             args: finalArgs,
@@ -556,20 +753,31 @@ export function createOpenCliRunner(options = {}) {
 
         if (code !== 0) {
           const structuredMessage =
-            parsed && typeof parsed === "object" && parsed.error
-              ? parsed.error.message || JSON.stringify(parsed.error)
+            partial.data && typeof partial.data === "object" && partial.data.error
+              ? partial.data.error.message || JSON.stringify(partial.data.error)
               : null;
-          reject(
-            new OpenCliError(
-              structuredMessage || stderr || `OpenCLI exited with code ${code}`,
-              result,
+          settle(() =>
+            reject(
+              new OpenCliError(
+                structuredMessage || partial.stderr || `OpenCLI exited with code ${code}`,
+                result,
+              ),
             ),
           );
           return;
         }
 
-        resolve(result);
+        settle(() => resolve(result));
       });
     });
   };
+
+  // Non-enumerable so it never leaks into JSON payloads, but callers such as the
+  // XHS worker can reject a cross-OS (WSL -> Windows) executable up front.
+  Object.defineProperty(runOpenCli, "executionPlatform", {
+    value: options.executionPlatform ?? resolveExecutionPlatform(resolved.command),
+    enumerable: false,
+  });
+
+  return runOpenCli;
 }

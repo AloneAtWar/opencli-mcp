@@ -1,6 +1,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { createXiaohongshuMedia, describeMediaCache } from "./xiaohongshu-media.js";
+import { summarizeFailure } from "./cli-failure.js";
 import {
   createOpenCliRunner,
   describeOpenCliCandidates,
@@ -151,11 +153,15 @@ function successResult(result, extra = {}) {
 
 function errorResult(error) {
   const details = error instanceof OpenCliError ? error.details : undefined;
+  const summary = summarizeFailure(error);
   const payload = {
     error: {
-      code: details?.data?.error?.code || details?.code || "OPENCLI_MCP_ERROR",
-      message: error.message,
-      hint: details?.data?.error?.hint,
+      code: summary.code,
+      message: summary.message,
+      ...(summary.hint === undefined ? {} : { hint: summary.hint }),
+      ...(summary.cli_error_code === undefined ? {} : { cli_error_code: summary.cli_error_code }),
+      ...(summary.exit_code === undefined ? {} : { exit_code: summary.exit_code }),
+      ...(summary.stderr_tail === undefined ? {} : { stderr_tail: summary.stderr_tail }),
     },
   };
   if (process.env.OPENCLI_MCP_DEBUG === "1") {
@@ -195,6 +201,14 @@ function resolutionExtra(env) {
   }
 }
 
+function mediaCacheToolSummary(cache) {
+  if (cache?.error) {
+    return `- Cache: effective values are unavailable (${cache.error}); call opencli_status for the running MCP process.`;
+  }
+  const megabytes = cache.download_cache_max_mb;
+  return `- Cache: effective for this MCP process: OPENCLI_XIAOHONGSHU_DOWNLOAD_CACHE_MAX_MB=${megabytes} (${megabytes * 1000000}-byte soft budget); when exceeded, oldest unprotected task directories are evicted FIFO by creation time. OPENCLI_XIAOHONGSHU_IMAGE_CACHE_MAX_FILES=${cache.image_cache_max_files} applies only to the images cache and prunes oldest files by mtime. Active, current and quarantined tasks are protected. Later calls can evict earlier files, so copy out anything you need to keep.`;
+}
+
 function wrap(handler) {
   return async (input) => {
     try {
@@ -207,19 +221,30 @@ function wrap(handler) {
 
 export function createServer(options = {}) {
   const run = options.runOpenCli ?? createOpenCliRunner(options.runnerOptions);
+  const mediaEnv = options.runnerOptions?.env ?? process.env;
+  const mediaCwd = options.runnerOptions?.cwd ?? process.cwd();
+  const effectiveMediaCache = describeMediaCache(mediaEnv, mediaCwd);
+  const xiaohongshu = createXiaohongshuMedia({
+    run,
+    env: mediaEnv,
+    cwd: mediaCwd,
+  });
   const server = new McpServer({ name: "opencli-mcp", version: "0.1.0" });
 
   server.registerTool(
     "opencli_status",
     {
-      description: "Check the installed OpenCLI version, or run OpenCLI doctor to verify the Windows Chrome Browser Bridge.",
+      description: "Check the installed OpenCLI version, or run OpenCLI doctor to verify the Windows Chrome Browser Bridge. Also reports the effective OpenCLI resolution and Xiaohongshu media-cache limits for this MCP process.",
       inputSchema: {
         doctor: z.boolean().default(false),
       },
     },
     wrap(async ({ doctor }) => {
       const args = doctor ? ["doctor"] : ["--version"];
-      const extra = resolutionExtra(options.runnerOptions?.env ?? process.env);
+      const extra = {
+        ...resolutionExtra(mediaEnv),
+        media_cache: describeMediaCache(mediaEnv, mediaCwd),
+      };
       try {
         return successResult(await run(args, { timeoutMs: doctor ? 120_000 : 30_000 }), extra);
       } catch (error) {
@@ -233,7 +258,7 @@ export function createServer(options = {}) {
   server.registerTool(
     "opencli_adapter_list",
     {
-      description: "Search installed OpenCLI adapters by keyword(s). Matches against site, command, name, description, and domain. Returns filtered results with full metadata, without returning the full adapter list for targeted lookups.",
+      description: "Search the installed OpenCLI CLI site adapter catalog by keyword(s). Matches against site, command, name, description, and domain. Returns filtered results with full per-adapter metadata, without returning the full adapter list for targeted lookups. This catalog contains CLI adapters only: the MCP-only Xiaohongshu media subcommands of opencli_run (site=\"xiaohongshu\" with command=\"download\" or \"images\") are implemented by this server, are not CLI adapters, and never appear here. Use opencli_run for Xiaohongshu media.",
       inputSchema: {
         keywords: z.array(z.string()).optional().describe("Keywords to filter adapters. All keywords must match (AND logic). Each keyword is checked against site, name, command, description, and domain (case-insensitive). Omit to return all adapters."),
         limit: z.number().int().positive().max(500).default(50).describe("Maximum number of adapters to return."),
@@ -274,7 +299,10 @@ export function createServer(options = {}) {
   server.registerTool(
     "opencli_run",
     {
-      description: "Run a structured OpenCLI site adapter command. Arguments are passed as an array without shell interpolation.",
+      description: "Run a structured OpenCLI site adapter command: site, command, args (argv, never a shell string), format. For every site except Xiaohongshu the site/command pair must exist in the CLI adapter catalog (see opencli_adapter_list) and the call is passed straight through to the OpenCLI CLI.\n\nXiaohongshu media is served by two MCP-only subcommands of this tool. They are not CLI adapters, never appear in opencli_adapter_list, and replace the former xiaohongshu_download / xiaohongshu_images tools. Pick by what the caller needs: choose download when a server-side consumer (OCR, ffmpeg, upload, further processing) needs real file paths or when the note has video; choose images when the model itself needs to look at the pictures. The generic format argument is ignored by both media subcommands: the wrapper always parses the CLI output as JSON internally so it can see per-media failures.\n\ndownload - args=[note_url, \"--output\", dir?, \"--timeout-ms\", \"60000\"]:\n- Downloads every media file of one note into the server-local managed cache and returns verified absolute server-local paths (never guessed from CLI stdout).\n- Result: status success|partial|error, path_scope=server_local, server_platform, managed_cache, download_root, output_directory, directory_source, inventory_complete, cli_result, and files[] with local_path, size_bytes, and a MIME type sniffed from the bytes on disk.\n- Root precedence: --output > OPENCLI_XIAOHONGSHU_DOWNLOAD_DIR > the server user's OS Downloads folder.\n- A partial download still returns every file it verified. Whenever status is not success the result also carries error {code, message, failed_indexes?}: code CLI_ERROR means the CLI process itself failed or timed out and also carries cli_error_code, exit_code when numeric, and a bounded stderr_tail when it differs from the message; code MEDIA_DOWNLOAD_FAILED means the CLI exited 0 but one or more media rows failed and message quotes the first CLI reason. errors[] only reports cleanup problems (CLEANUP_PENDING, each with a message); the full per-item rows stay in cli_result. inventory_complete=false means a timeout or output limit stopped the inventory, so treat files[] as partial.\n\nimages - args=[note_url, \"--indexes\", \"1,3\", \"--timeout-ms\", \"60000\"]:\n- Reuses the same managed download, then returns the images directly to the model as native MCP ImageContent. There is no output argument, and the images success payload carries no local paths; a CLI failure message may still quote a server path, because paths are diagnostics rather than secrets.\n- args=[\"--help\"] prints the exact argument set. --indexes takes a comma-separated list of 1-based original media indices; --index is also accepted and repeatable; omit both to return every image.\n- Indices come from the CLI's on-disk filenames <note-id>_<n>.<ext> and cover every downloaded media item including videos, but videos are never returned as images, so a note with video can have no image at index 1. Index mapping and image/video classification are never guessed or renumbered.\n- Response caps: at most 10 images, 10 MiB each, 20 MiB total. The CLI may still download the whole note first, so these caps bound the response, not the download traffic or disk peak. The MIME type is sniffed from the real bytes, not the filename suffix.\n- Errors: status is success, partial or error; a top-level error {code, message, index?, available_indexes?, cli_error_code?, exit_code?} is added whenever status is not success, and available_indexes always lists the 1-based indexes that actually exist on disk for this note, plus note_id when the download produced exactly one note id. Read error.code and error.message first, then retry with an index from available_indexes; per-item detail stays in errors[] where every entry carries a human message and, when the CLI reported one, its own reason in detail. Codes: CLI_ERROR (the CLI's real message is quoted, e.g. a risk-control or empty-result message), IMAGE_DOWNLOAD_FAILED, IMAGE_NOT_FOUND (message names the available indexes), IMAGE_LIMIT, IMAGE_READ_FAILED, IMAGE_INDEX_UNMAPPABLE, IMAGE_INDEX_AMBIGUOUS, NO_IMAGES, TERMINATION_UNCONFIRMED, CLEANUP_PENDING. The CLI currently packs a per-item reason into its row's size text instead of a structured field, so per-item codes are assigned by this server.\n\nBoth subcommands:\n- note_url must be the full note URL carrying its xsec_token (https://www.xiaohongshu.com/explore/<id>?xsec_token=...) or an xhslink.com short link. Take it from the url field of search/feed rows or the user's share link; never invent, guess or strip the token.\n- They run on the MCP server host, not the client: results are server-local (path_scope=server_local, server_platform reports the OS) and a remote client cannot open those paths unless it shares that filesystem.\n- Both share one managed cache: OPENCLI_XIAOHONGSHU_DOWNLOAD_CACHE_MAX_MB (default 100; 1 MB = 1,000,000 bytes) budgets the whole managed tree and reclaims oldest-first, and OPENCLI_XIAOHONGSHU_IMAGE_CACHE_MAX_FILES (default 10) prunes the image cache oldest-first. Later calls can evict earlier files, so copy out anything you need to keep.\n- The xsec_token, cookies and other credentials are redacted from cli_result and from every error message, while server-local paths are kept when they explain a failure.\n\nHosts cache a snapshot of tools/list: calls always reach this live server, but new tools, renamed tools and edited descriptions only appear after the host app/connector is refreshed (for ChatGPT apps: the Refresh action in the app or connector settings; as a last resort remove and re-add the connector). Restarting this MCP server, the tunnel, or the host app does not refresh that snapshot.".replace(
+        "- Both share one managed cache: OPENCLI_XIAOHONGSHU_DOWNLOAD_CACHE_MAX_MB (default 100; 1 MB = 1,000,000 bytes) budgets the whole managed tree and reclaims oldest-first, and OPENCLI_XIAOHONGSHU_IMAGE_CACHE_MAX_FILES (default 10) prunes the image cache oldest-first. Later calls can evict earlier files, so copy out anything you need to keep.",
+        mediaCacheToolSummary(effectiveMediaCache),
+      ),
       inputSchema: {
         site: z.string(),
         command: z.string(),
@@ -286,6 +314,12 @@ export function createServer(options = {}) {
       assertAdapterName(site, "site");
       assertAdapterName(command, "command");
       validateStringArray(args);
+      if (site === "xiaohongshu" && command === "download") {
+        return xiaohongshu.runDownload(args, { format });
+      }
+      if (site === "xiaohongshu" && command === "images") {
+        return xiaohongshu.runImages(args, { format });
+      }
       return successResult(await run([site, command, ...args, "-f", format]));
     }),
   );
