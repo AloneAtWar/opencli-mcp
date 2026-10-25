@@ -7,6 +7,8 @@
 // reason, its semantic code, the process exit code when there is one, and any
 // hint - all with credentials removed and the text bounded.
 
+import { cutHead, cutTail } from "./text-safe.js";
+
 const SECRET_QUERY = /([?&](?:xsec_token|xsec_source|token|access_token|auth|key)=)[^&\s"']+/gi;
 
 // Chrome's Tabs API refuses a tab navigation with this text when the automation
@@ -58,7 +60,7 @@ function normalize(value, secrets) {
 export function boundedText(value, { secrets = [], limit = 300 } = {}) {
   const text = normalize(value, secrets);
   if (!text) return undefined;
-  return text.length > limit ? `${text.slice(0, limit)}...` : text;
+  return text.length > limit ? `${cutHead(text, limit)}...` : text;
 }
 
 // Keeps the end of a value: the actionable line of a CLI stderr dump is the last
@@ -66,7 +68,7 @@ export function boundedText(value, { secrets = [], limit = 300 } = {}) {
 export function boundedTail(value, { secrets = [], limit = 300 } = {}) {
   const text = normalize(value, secrets);
   if (!text) return undefined;
-  return text.length > limit ? `...${text.slice(-limit)}` : text;
+  return text.length > limit ? `...${cutTail(text, limit)}` : text;
 }
 
 export function stderrTail(source, lines = 3) {

@@ -169,3 +169,114 @@ test("MCP exposes Xiaohongshu media only through opencli_run subcommands", async
     await rm(root, { recursive: true, force: true });
   }
 });
+
+// A lone surrogate anywhere in a tool result makes the peer reject the whole JSON
+// body with HTTP 400 (invalid_json_payload), which tears the MCP session down.
+// Upstream text can already be malformed - OpenCLI truncates page text by code
+// unit too - so every result is normalized on the way out of `wrap`.
+const LONE_SURROGATE = "\ud83d";
+
+function findTextBlock(result) {
+  return result.content.find((block) => block.type === "text").text;
+}
+
+test("tool results are made well-formed before they leave the server", async () => {
+  const server = createServer({
+    runOpenCli: async () => ({ data: `release 1.8.8${LONE_SURROGATE}` }),
+    runnerOptions: { env: {} },
+  });
+  const client = new Client({ name: "well-formed-result", version: "1.0" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  try {
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    const result = await client.callTool({ name: "opencli_status", arguments: { doctor: false } });
+
+    const text = findTextBlock(result);
+    assert.equal(text.isWellFormed(), true);
+    assert.equal(result.structuredContent.value.isWellFormed(), true);
+    assert.equal(result.structuredContent.value, "release 1.8.8\uFFFD");
+    assert.equal(text.includes("\\ud83d"), false);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+test("error results are made well-formed too", async () => {
+  const server = createServer({
+    runOpenCli: async () => {
+      throw new Error(`OpenCLI exploded ${LONE_SURROGATE}`);
+    },
+    runnerOptions: { env: {} },
+  });
+  const client = new Client({ name: "well-formed-error", version: "1.0" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  try {
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    const result = await client.callTool({ name: "opencli_status", arguments: { doctor: false } });
+
+    assert.equal(result.isError, true);
+    const text = findTextBlock(result);
+    assert.equal(text.isWellFormed(), true);
+    assert.equal(result.structuredContent.error.message.isWellFormed(), true);
+  } finally {
+    await client.close();
+    await server.close();
+  }
+});
+
+// A compact page snapshot is one result shape that can carry a lone surrogate in
+// two ways: the wrapper's own cut landing inside a pair, and text that arrived
+// from OpenCLI already broken.
+test("compact snapshots reach the host well-formed either way", async () => {
+  const emojiLine = `${"内容👍看板\n".repeat(400)}`;
+  const cases = [
+    // Already broken upstream, and small enough that nothing gets truncated: only
+    // the boundary sanitizer can save this one.
+    { label: "dirty upstream", data: `URL: https://example.com\n👍${LONE_SURROGATE}`, maxChars: 12_000, repaired: true },
+    // Invariant guard on the wrapper's own compaction: whatever the budget, the
+    // host never receives a lone surrogate or a replacement character. (The
+    // compaction budget reserves room for its marker, so this path does not cut
+    // in practice - the reachable cuts are covered by browser-flow's preview
+    // test and browser-advanced's in-page tests.)
+    ...Array.from({ length: 13 }, (_, index) => ({
+      label: `budget sweep ${2000 + index}`,
+      data: `URL: https://example.com\n${emojiLine}`,
+      maxChars: 2000 + index,
+      repaired: false,
+    })),
+  ];
+
+  for (const { label, data, maxChars, repaired } of cases) {
+    const server = createServer({ runOpenCli: async () => ({ data }), runnerOptions: { env: {} } });
+    const client = new Client({ name: `snapshot-${label}`, version: "1.0" });
+    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+    try {
+      await server.connect(serverTransport);
+      await client.connect(clientTransport);
+      const result = await client.callTool({
+        name: "browser_snapshot_compact",
+        arguments: { max_chars: maxChars, max_lines: 500 },
+      });
+
+      assert.ok(!result.isError, `${label} call`);
+      const text = findTextBlock(result);
+      assert.equal(text.isWellFormed(), true, label);
+      assert.equal(result.structuredContent.value.isWellFormed(), true, label);
+      assert.equal(text.includes("\\ud83d"), false, label);
+      assert.ok(result.structuredContent.value.length <= maxChars, `${label} budget`);
+
+      if (repaired) {
+        assert.equal(result.structuredContent.value.includes("\uFFFD"), true, `${label} repaired in place`);
+      } else {
+        // A clean cut drops the half character instead of corrupting it.
+        assert.equal(result.structuredContent.value.includes("\uFFFD"), false, label);
+      }
+    } finally {
+      await client.close();
+      await server.close();
+    }
+  }
+});

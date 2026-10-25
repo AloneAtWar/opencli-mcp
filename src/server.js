@@ -32,6 +32,7 @@ import {
   normalizeSession,
   validateStringArray,
 } from "./commands.js";
+import { deepWellFormed } from "./text-safe.js";
 
 const sessionSchema = z.string().optional().describe("Stable OpenCLI browser session name. Reuse across calls; defaults to OPENCLI_MCP_SESSION or hermes-default.");
 const tabSchema = z.string().optional().describe("Tab/page identity returned by browser_tabs or browser_open.");
@@ -217,9 +218,9 @@ function resolutionExtra(env) {
 function wrap(handler) {
   return async (input) => {
     try {
-      return await handler(input);
+      return wellFormedResult(await handler(input));
     } catch (error) {
-      return errorResult(error);
+      return wellFormedResult(errorResult(error));
     }
   };
 }
@@ -230,6 +231,28 @@ function mediaCacheToolSummary(cache) {
   }
   const megabytes = cache.download_cache_max_mb;
   return `- Cache: effective for this MCP process: OPENCLI_XIAOHONGSHU_DOWNLOAD_CACHE_MAX_MB=${megabytes} (${megabytes * 1000000}-byte soft budget); when exceeded, oldest unprotected task directories are evicted FIFO by creation time. OPENCLI_XIAOHONGSHU_IMAGE_CACHE_MAX_FILES=${cache.image_cache_max_files} applies only to the images cache and prunes oldest files by mtime. Active, current and quarantined tasks are protected. Later calls can evict earlier files, so copy out anything you need to keep.`;
+}
+
+// Last line of defence for the response the host receives. A lone surrogate
+// anywhere in a tool result - page text, CLI JSON, or an echo of the caller's
+// own arguments - makes the peer reject the whole JSON body with HTTP 400, which
+// kills the MCP session. Truncation sites should not create them, but they can
+// also arrive from upstream (OpenCLI truncates page text by code unit too), so
+// every tool result is normalized on the way out.
+//
+// The sanitizer must never fail a call that would otherwise succeed: if it
+// throws for any reason, the original result is returned untouched.
+function wellFormedResult(result) {
+  try {
+    return deepWellFormed(result);
+  } catch (error) {
+    // The sanitizer must never fail a call that would otherwise succeed, but a
+    // silent failure means the peer can still kill the session on this payload.
+    if (process.env.OPENCLI_MCP_DEBUG === "1") {
+      process.stderr.write(`[opencli-mcp] well-formed normalization failed: ${error?.message ?? error}\n`);
+    }
+    return result;
+  }
 }
 
 // Media subcommands handled by this MCP server rather than passed through. They

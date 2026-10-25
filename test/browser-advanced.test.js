@@ -367,3 +367,74 @@ test("collect discover mode returns candidate selectors", () => {
   assert.match(expr, /candidates/);
   assert.match(expr, /tip/);
 });
+
+// --- in-page truncation ---
+
+// These expressions run inside the page through `opencli browser <session> eval`,
+// so a code-unit cut there leaves a lone surrogate in the eval result, which then
+// travels back through the MCP response.
+test("collect and discover expressions cut field text on code point boundaries", () => {
+  const collect = buildCollectExpression({ selector: ".card", fields: [{ name: "text", property: "text" }] });
+  const discover = buildCollectExpression({ discover: true });
+  for (const expr of [collect, discover]) {
+    assert.match(expr, /const cut=\(s,n\)=>/);
+    assert.doesNotMatch(expr, /\.slice\(0,120\)/);
+    assert.doesNotMatch(expr, /\.slice\(0,200\)/);
+  }
+  assert.doesNotMatch(collect, /value=value\.slice\(0,config\.maxFieldChars\)/);
+  assert.match(collect, /value=cut\(value,config\.maxFieldChars\)/);
+});
+
+function evalInPage(expression, document) {
+  // The expressions are self-contained IIFEs that only need `document`.
+  return new Function("document", `return ${expression}`)(document);
+}
+
+test("collect leaves no half emoji when max_field_chars lands inside a pair", () => {
+  const cardText = "👍👍👍";
+  const card = {
+    matches: () => false,
+    querySelector: () => null,
+    innerText: cardText,
+    textContent: cardText,
+    getAttribute: () => null,
+  };
+  const document = { querySelectorAll: (selector) => (selector === ".card" ? [card] : []) };
+  const expression = buildCollectExpression({
+    selector: ".card",
+    fields: [{ name: "text", property: "text" }],
+    required_fields: [],
+    offset: 0,
+    limit: 10,
+    // Odd limit: 5 code units stop exactly between the two halves of the 3rd emoji.
+    max_field_chars: 5,
+  });
+
+  const data = evalInPage(expression, document);
+  assert.equal(data.count, 1);
+  const text = data.items[0].text;
+  assert.equal(text.isWellFormed(), true);
+  assert.equal(text, "👍👍");
+});
+
+test("discover leaves no half emoji in probe samples", () => {
+  const title = `${"x".repeat(119)}👍`;
+  const preview = `${"y".repeat(199)}👍`;
+  const heading = { innerText: title, textContent: title };
+  const previewNode = { innerText: preview, textContent: preview };
+  const item = {
+    tagName: "LI",
+    innerText: title,
+    textContent: title,
+    querySelector: (selector) => (selector === "h3" ? heading : selector === "span" ? previewNode : null),
+  };
+  const document = { querySelectorAll: (selector) => (selector === "li" ? [item, item] : []) };
+
+  const data = evalInPage(buildCollectExpression({ discover: true }), document);
+  assert.equal(data.candidates.length, 1);
+  const sample = data.candidates[0].items[0];
+  assert.equal(sample.title.isWellFormed(), true);
+  assert.equal(sample.title, "x".repeat(119));
+  assert.equal(sample.preview.isWellFormed(), true);
+  assert.equal(sample.preview, "y".repeat(199));
+});
