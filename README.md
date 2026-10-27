@@ -95,6 +95,8 @@ PATH 各目录下的 node_modules\@jackwener\opencli
 { "bin": "node", "prefixArgs": ["C:\\Users\\<user>\\AppData\\Roaming\\npm\\node_modules\\@jackwener\\opencli\\dist\\src\\main.js"] }
 ```
 
+配置文件中的相对 JavaScript `bin` 路径以配置文件所在目录为基准；环境变量中的相对 JavaScript 入口以 runner 的工作目录为基准（默认是进程 cwd，可通过 `runnerOptions.cwd` 指定）。`prefixArgs` 按原样传给 CLI。
+
 ### `OPENCLI_MCP_BIN` 分类规则
 
 | 值 | 行为 |
@@ -248,7 +250,7 @@ agent:
 
 清理与淘汰只针对**本服务拥有**的请求目录：每个 download_root 用一份根目录所有权记录 `.opencli-xhs-owned.json` 登记本服务创建的请求目录（名称形如 `opencli-xhs-<时间戳>-<uuid>`，`download` 位于根目录，`images` 位于 `opencli-xhs-images` 容器内），回收时只认这份记录；用户自建目录、用户文件与固定容器本身永不回收。该记录只是所有权清单，不登记笔记 ID、文件清单或媒体元数据——本功能没有内容注册表，笔记 ID 与图片序号只来自 CLI 实际下载到磁盘的文件。
 
-请求目录创建时以 `quarantined=true` 记入所有权记录，确认写入结束（正常退出或已确认终止）后清除。停止无法证实或进程崩溃遗留的目录保持隔离：不盘点文件、不参与淘汰，但字节仍计入总配额；需人工确认下游停止写入后手动清理。超时或输出超限一律标记 `inventory_complete=false`；已确认终止时仍返回核验后的文件。活动任务与清理串行化只在单个 MCP 进程内生效，同一根目录应由一个 MCP 进程写入。
+请求目录创建时以 `quarantined=true` 记入所有权记录，确认写入结束（正常退出或已确认终止）且本次核验、读取完成后清除。停止无法证实或进程崩溃遗留的目录保持隔离：不盘点文件、不参与淘汰，但字节仍计入总配额；需人工确认下游停止写入后手动清理。超时或输出超限一律标记 `inventory_complete=false`；已确认终止时仍返回核验后的文件。清单更新和清理通过跨进程文件锁串行化，多个 MCP 进程可共享同一根目录；下载期间不持有根目录锁，活动任务由清单中的隔离标记保护。
 
 `images` 子命令与 `download` 子命令共享同一根目录和同一 100 MB 默认软预算；字节预算按 task 创建时间 FIFO 淘汰最旧的非保护目录。`OPENCLI_XIAOHONGSHU_IMAGE_CACHE_MAX_FILES` 默认 10，只统计 `opencli-xhs-images` 图片子树，不限制 `download` 保存的图片数量；超过时按文件最早修改时间删除。没有 200 张硬上限。图片数量清理先于统一配额清理，两步由同一执行器完成。读取后不立即清空，也不增加 LRU、有效期或缓存命中逻辑。两种清理均避开仍在下载或读取的文件。
 
@@ -294,12 +296,12 @@ match_level: exact | stable | reidentified
 `browser_fill_submit` 把“填值并提交”压成一次 MCP 调用：
 
 - CSS target 默认在一次页面执行中设置原生 input/textarea value、派发 input/change、聚焦并派发 Enter 键事件；
-- 数字 ref 现在会被解析为 `[data-opencli-ref="N"]` 并走同一条原子 DOM 路径（此前会静默退回 CLI 路径）；ref 已失效时记录 `atomic_skipped: true` + `atomic_error` 后回退；
+- 数字 ref（包括数字字符串）通过官方 CLI 的 `fill → focus → keys` 路径解析，保留元素身份和 stale-ref 校验；ref 已失效时停止，不继续提交；
 - `submit_strategy` 支持三种模式：
   - `form`（默认）：派发事件后尝试 `requestSubmit()`，适合百度等传统表单；
   - `event`：只派发键盘事件，不触发表单提交，适合纯 JS 监听 Enter 的 SPA；
   - `both`：先派发事件再尝试 `requestSubmit()`；
-- 回退为官方 CLI 的 `fill → focus → keys` 时（显式 `atomic=false` 或 ref 失效），结果显式返回 `atomic_skipped`、`focus_ok`、`submit_verified`、`url_before`、`url_after` 与 `warnings`（`focus_failed` / `submit_not_verified`），不再伪装成成功；
+- 使用官方 CLI 路径时（数字 ref、语义定位器或显式 `atomic=false`），结果返回 `atomic_skipped`、`focus_ok`、`submit_verified`、`url_before`、`url_after` 与 `warnings`（`focus_failed` / `submit_not_verified`）；导航验证与填值和提交使用同一指定标签页；
 - 该工具保证提交事件被派发，后续仍应通过 `browser_wait_any` 验证导航或内容就绪。
 
 `browser_wait_any` 的条件支持 `tier` 优先级：

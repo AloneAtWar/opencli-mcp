@@ -4,6 +4,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { mkdir, readdir, lstat, realpath, open, readFile, writeFile, rename, rm } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import lockfile from 'proper-lockfile';
 import { boundedText, isNavigationRejected, redactSecrets, summarizeCliResult, summarizeFailure, urlSecrets } from './cli-failure.js';
 
 const CONTAINER = 'opencli-xhs-images';
@@ -62,7 +63,29 @@ function indexListArg(value, label) {
 }
 function locked(root, action) {
   const previous = locks.get(root) ?? Promise.resolve();
-  const next = previous.catch(() => {}).then(action);
+  const next = previous.catch(() => {}).then(async () => {
+    let compromised;
+    const assertHeld = () => { if (compromised) throw compromised; };
+    // All MCP processes using this root share the manifest and cleanup budget.
+    // Keep the lock inside the canonical root, refresh it during longer cleanup,
+    // and recover a crashed holder's lock after the same stale interval everywhere.
+    const release = await lockfile.lock(root, {
+      lockfilePath: path.join(root, `${MANIFEST}.lock`),
+      stale: 10_000,
+      update: 2_000,
+      retries: { retries: 120, minTimeout: 50, maxTimeout: 250, factor: 1.2, randomize: true },
+      // A lost lock fails this transaction instead of throwing asynchronously and
+      // terminating the MCP process. Every shared write checks ownership again.
+      onCompromised: error => { compromised = error; },
+    });
+    try {
+      const value = await action(assertHeld);
+      assertHeld();
+      return value;
+    } finally {
+      if (!compromised) await release();
+    }
+  });
   locks.set(root, next);
   return next.finally(() => { if (locks.get(root) === next) locks.delete(root); });
 }
@@ -128,11 +151,11 @@ async function regularFiles(dir) {
   await walk(dir);
   return files;
 }
-async function pruneEmpty(dir) {
+async function pruneEmpty(dir, assertHeld) {
   for (const entry of await readdir(dir, { withFileTypes: true })) {
-    if (entry.isDirectory() && !entry.isSymbolicLink()) await pruneEmpty(path.join(dir, entry.name));
+    if (entry.isDirectory() && !entry.isSymbolicLink()) await pruneEmpty(path.join(dir, entry.name), assertHeld);
   }
-  if (!(await readdir(dir)).length) await rm(dir, { recursive: true });
+  if (!(await readdir(dir)).length) { assertHeld(); await rm(dir, { recursive: true }); }
 }
 async function inventory(dir) {
   const root = await realpath(dir), files = [];
@@ -164,17 +187,21 @@ async function manifest(root) {
     return data;
   } catch (error) { if (error.code === 'ENOENT') return { version: 1, tasks: [] }; throw error; }
 }
-async function saveManifest(root, data) {
+async function saveManifest(root, data, assertHeld) {
   const temporary = path.join(root, `${MANIFEST}.${randomUUID()}.tmp`);
-  await writeFile(temporary, JSON.stringify(data), { flag: 'wx' });
-  await rename(temporary, path.join(root, MANIFEST));
+  try {
+    assertHeld();
+    await writeFile(temporary, JSON.stringify(data), { flag: 'wx' });
+    assertHeld();
+    await rename(temporary, path.join(root, MANIFEST));
+  } finally { await rm(temporary, { force: true }); }
 }
 function taskPath(root, task) {
   if (!/^opencli-xhs-\d+-[a-f0-9-]+$/.test(task.name) || !['images', 'download'].includes(task.kind)) return null;
   return path.join(root, ...(task.kind === 'images' ? [CONTAINER] : []), task.name);
 }
 async function cleanup(root, maxBytes, maxImages, protect) {
-  return locked(root, async () => {
+  return locked(root, async (assertHeld) => {
     const data = await manifest(root), tasks = [], errors = [];
     for (const task of data.tasks) {
       const dir = taskPath(root, task);
@@ -191,11 +218,12 @@ async function cleanup(root, maxBytes, maxImages, protect) {
       const verifiedImages = new Set((await inventory(task.dir)).filter(file => file.mime_type.startsWith('image/')).map(file => file.local_path));
       for (const file of task.files) {
         if (verifiedImages.has(file.local_path)) imageFiles.push(file);
-        else if (dirEligible(task.dir)) { try { await rm(file.local_path); } catch { errors.push({ ...CLEANUP_PENDING }); } }
+        else if (dirEligible(task.dir)) { assertHeld(); try { await rm(file.local_path); } catch { errors.push({ ...CLEANUP_PENDING }); } }
       }
     }
     imageFiles.sort((a,b) => a.mtime - b.mtime || a.local_path.localeCompare(b.local_path));
     for (const file of imageFiles.slice(0, Math.max(0, imageFiles.length - maxImages))) {
+      assertHeld();
       try { await rm(file.local_path); } catch { errors.push({ ...CLEANUP_PENDING }); }
     }
     let total = 0;
@@ -204,16 +232,17 @@ async function cleanup(root, maxBytes, maxImages, protect) {
     for (const task of tasks) {
       if (total <= maxBytes) break;
       if (task.dir === protect || task.protected || active.has(task.dir)) continue;
+      assertHeld();
       try { await rm(task.dir, { recursive: true }); total -= task.size; data.tasks = data.tasks.filter(t => t.name !== task.name); }
       catch { errors.push({ ...CLEANUP_PENDING }); }
     }
     for (const task of tasks.filter(t => t.kind === 'images' && !t.protected && !active.has(t.dir) && t.dir !== protect)) {
-      try { await pruneEmpty(task.dir); } catch (error) { if (error.code !== 'ENOENT') errors.push({ ...CLEANUP_PENDING }); }
+      try { await pruneEmpty(task.dir, assertHeld); } catch (error) { if (error.code === 'ECOMPROMISED') throw error; if (error.code !== 'ENOENT') errors.push({ ...CLEANUP_PENDING }); }
     }
     const retained = [];
     for (const task of data.tasks) { const dir = taskPath(root, task); if (dir && existsSync(dir)) retained.push(task); }
     data.tasks = retained;
-    await saveManifest(root, data);
+    await saveManifest(root, data, assertHeld);
     return errors;
   });
   function dirEligible(dir) { return !active.has(dir); }
@@ -266,7 +295,7 @@ export function describeMediaCache(env = process.env, cwd = process.cwd()) {
 export function createXiaohongshuMedia({ run, env = process.env, cwd = process.cwd() }) {
   async function clean(root, maxBytes, maxImages, protect) {
     try { return await cleanup(root, maxBytes, maxImages, protect); }
-    catch { return [{ ...CLEANUP_PENDING }]; }
+    catch (error) { if (error.code === 'ECOMPROMISED') throw error; return [{ ...CLEANUP_PENDING }]; }
   }
   // Media errors reuse the shared summary fields verbatim, so a media result and
   // the generic tool-error payload can never disagree about the same CLI failure.
@@ -299,6 +328,15 @@ export function createXiaohongshuMedia({ run, env = process.env, cwd = process.c
     const name = `opencli-xhs-${Date.now()}-${randomUUID()}`, dir = path.join(parent, name);
     active.add(dir);
     let cli, failure, files = [], complete = true, unconfirmed = false, retry;
+    let writerSettled = false, protectionReleased = false;
+    // Other processes cannot see active: the persistent flag protects both the
+    // writer and the subsequent file reads. A read error still releases this
+    // temporary protection once the CLI is known to have stopped safely.
+    const releaseProtection = async () => {
+      if (!writerSettled || unconfirmed || protectionReleased) return;
+      await locked(root, async (assertHeld) => { const data = await manifest(root); const task = data.tasks.find(t => t.name === name); if (task) task.quarantined = false; await saveManifest(root, data, assertHeld); });
+      protectionReleased = true;
+    };
     // Chrome can refuse the first navigation when the automation tab was closed
     // or replaced between lease resolution and tabs.update. These commands only
     // read the note and write into this call's own directory, so one replay on a
@@ -315,12 +353,12 @@ export function createXiaohongshuMedia({ run, env = process.env, cwd = process.c
       unconfirmed = stoppedError && error.details?.termination_confirmed !== true;
       if (unconfirmed) {
         quarantined.add(dir);
-        await locked(root, async () => { const data = await manifest(root); const task = data.tasks.find(t => t.name === name); if (task) task.quarantined = true; await saveManifest(root, data); });
+        await locked(root, async (assertHeld) => { const data = await manifest(root); const task = data.tasks.find(t => t.name === name); if (task) task.quarantined = true; await saveManifest(root, data, assertHeld); });
       }
     };
     try {
       // A crashed or unconfirmed writer stays quarantined across server restarts.
-      await locked(root, async () => { await mkdir(dir); const data = await manifest(root); const created = Math.max(Date.now(), ...data.tasks.map(t => (Number(t.created) || 0) + 1)); data.tasks.push({ name, kind, created, quarantined: true }); await saveManifest(root, data); });
+      await locked(root, async (assertHeld) => { assertHeld(); await mkdir(dir); const data = await manifest(root); const created = Math.max(Date.now(), ...data.tasks.map(t => (Number(t.created) || 0) + 1)); data.tasks.push({ name, kind, created, quarantined: true }); await saveManifest(root, data, assertHeld); });
       try { cli = await callOnce(); }
       catch (error) {
         // A stopped run may leave a live process still writing into this
@@ -335,7 +373,7 @@ export function createXiaohongshuMedia({ run, env = process.env, cwd = process.c
           // refused. The replay owns this request directory, so it starts clean:
           // only a normally-exited run reaches this branch (a stopped run takes the
           // quarantine path above), so nothing is still writing here.
-          await locked(root, async () => { await rm(dir, { recursive: true, force: true }); await mkdir(dir); });
+          await locked(root, async (assertHeld) => { assertHeld(); await rm(dir, { recursive: true, force: true }); assertHeld(); await mkdir(dir); });
           try {
             cli = await callOnce(session);
             // outcome is filled in from the final status below: a replay that
@@ -347,7 +385,7 @@ export function createXiaohongshuMedia({ run, env = process.env, cwd = process.c
           }
         }
       }
-      if (!unconfirmed) await locked(root, async () => { const data = await manifest(root); const task = data.tasks.find(t => t.name === name); if (task) task.quarantined = false; await saveManifest(root, data); });
+      writerSettled = true;
       if (!unconfirmed) files = await inventory(dir);
       const rows = Array.isArray(cli?.data) ? cli.data : [];
       const failedRows = rows.filter(row => row && typeof row === 'object' && typeof row.status === 'string' && /^(error|failed|failure)$/i.test(row.status));
@@ -371,7 +409,9 @@ export function createXiaohongshuMedia({ run, env = process.env, cwd = process.c
           ...(failedIndexes.length ? { failed_indexes: failedIndexes } : {}),
           ...summaryExtras(failureSummary),
         };
-        return result({ status, path_scope: 'server_local', server_platform: process.platform, managed_cache: true, download_root: root, output_directory: dir, directory_source: resolved.directory_source, files: files.map(({ mtime, ...file }) => file), cli_result: redact(cli, input.note_url), inventory_complete: complete, errors: cleanupErrors, ...(retry ? { retry } : {}), ...(error ? { error } : {}) });
+        const response = result({ status, path_scope: 'server_local', server_platform: process.platform, managed_cache: true, download_root: root, output_directory: dir, directory_source: resolved.directory_source, files: files.map(({ mtime, ...file }) => file), cli_result: redact(cli, input.note_url), inventory_complete: complete, errors: cleanupErrors, ...(retry ? { retry } : {}), ...(error ? { error } : {}) });
+        await releaseProtection();
+        return response;
       }
       const blocks = [], images = [], errors = [];
       if (failure) {
@@ -426,6 +466,7 @@ export function createXiaohongshuMedia({ run, env = process.env, cwd = process.c
         finally { await handle?.close(); }
       }
       if (!images.length && !errors.length) errors.push({ code: 'NO_IMAGES', message: 'The CLI downloaded no images for this note' });
+      await releaseProtection();
       active.delete(dir);
       errors.push(...await clean(root, maxBytes, maxImages, null));
       const status = errors.length ? (images.length ? 'partial' : 'error') : 'success';
@@ -433,7 +474,10 @@ export function createXiaohongshuMedia({ run, env = process.env, cwd = process.c
       const error = status === 'success' ? undefined : primaryError(errors);
       const noteIds = [...new Set(files.flatMap(file => { const relative = path.relative(dir, file.local_path).split(path.sep); return relative.length > 1 ? [relative[0]] : []; }))];
       return result({ status, managed_cache: true, inventory_complete: complete, ...(noteIds.length === 1 ? { note_id: noteIds[0] } : {}), available_indexes: availableIndexes, image_blocks_per_response: imageBlockBudget, ...(skippedIndexes.length ? { skipped_indexes: skippedIndexes } : {}), images, errors, ...(retry ? { retry } : {}), ...(error ? { error } : {}) }, blocks);
-    } finally { active.delete(dir); }
+    } finally {
+      try { await releaseProtection(); }
+      finally { active.delete(dir); }
+    }
   }
   return {
     download: input => execute(input, 'download'),

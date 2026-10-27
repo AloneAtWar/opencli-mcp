@@ -157,6 +157,37 @@ test("fill_submit fallback verifies navigation around fill, focus, and key press
   assert.deepEqual(result.data.warnings, []);
 });
 
+test("fill_submit verifies navigation in the explicitly targeted tab", async () => {
+  const calls = [];
+  const urls = new Map([
+    ["default", "https://example.com/unrelated"],
+    ["target-tab", "https://example.com/search"],
+  ]);
+  const run = async (args) => {
+    calls.push(args);
+    const tabIndex = args.indexOf("--tab");
+    const tab = tabIndex === -1 ? "default" : args[tabIndex + 1];
+    if (args[2] === "get" && args[3] === "url") return { data: urls.get(tab) };
+    if (args[2] === "keys") urls.set(tab, "https://example.com/results");
+    return { data: { focused: true } };
+  };
+  const result = await executeFillSubmit(run, {
+    session: "submit-tabs",
+    target: "#search",
+    value: "OpenCLI",
+    atomic: false,
+    tab: "target-tab",
+  });
+  assert.deepEqual(calls.filter((args) => args[2] === "get"), [
+    ["browser", "submit-tabs", "get", "url", "--tab", "target-tab"],
+    ["browser", "submit-tabs", "get", "url", "--tab", "target-tab"],
+  ]);
+  assert.equal(result.data.url_before, "https://example.com/search");
+  assert.equal(result.data.url_after, "https://example.com/results");
+  assert.equal(result.data.submit_verified, true);
+  assert.deepEqual(result.data.warnings, []);
+});
+
 test("fill_submit fallback skips url verification when verify_navigation is false", async () => {
   const calls = [];
   const run = async (args) => {
@@ -200,48 +231,51 @@ test("fill_submit uses one atomic DOM event command for CSS targets", async () =
   assert.equal(result.data.mode, "atomic-dom-event");
 });
 
-test("fill_submit uses the atomic DOM path for a numeric ref target", async () => {
-  const calls = [];
-  const run = async (args) => {
-    calls.push(args);
-    return { data: { ok: true, filled: true, focused: true, events_dispatched: true } };
-  };
-  const result = await executeFillSubmit(run, {
-    session: "atomic-ref",
-    target: 1,
-    value: "OpenCLI",
-    key: "Enter",
-    timeout_ms: 5000,
-  });
-  assert.equal(calls.length, 1);
-  assert.deepEqual(calls[0].slice(0, 3), ["browser", "atomic-ref", "eval"]);
-  assert.match(calls[0][3], /\[data-opencli-ref=\\"1\\"\]/);
-  assert.equal(result.data.mode, "atomic-dom-event");
+test("fill_submit delegates numeric refs to the official CLI resolver even when atomic is enabled", async () => {
+  for (const target of [1, "1", " 1 "]) {
+    const calls = [];
+    const run = async (args) => {
+      calls.push(args);
+      return { data: { focused: true } };
+    };
+    const result = await executeFillSubmit(run, {
+      session: "numeric-ref",
+      target,
+      value: "OpenCLI",
+      atomic: true,
+      verify_navigation: false,
+      tab: "target-tab",
+    });
+    assert.deepEqual(calls, [
+      ["browser", "numeric-ref", "fill", "1", "OpenCLI", "--tab", "target-tab"],
+      ["browser", "numeric-ref", "focus", "1", "--tab", "target-tab"],
+      ["browser", "numeric-ref", "keys", "Enter", "--tab", "target-tab"],
+    ]);
+    assert.equal(result.data.mode, "cli-fallback");
+    assert.equal(result.data.atomic_skipped, true);
+  }
 });
 
-test("fill_submit falls back to the CLI path when a numeric ref is stale", async () => {
-  const calls = [];
-  const run = async (args) => {
-    calls.push(args);
-    if (args[2] === "eval") return { data: { ok: false, error: "target_not_found" } };
-    return { data: { focused: true } };
-  };
-  const result = await executeFillSubmit(run, {
-    session: "ref-stale",
-    target: 1,
-    value: "x",
-    verify_navigation: false,
-    timeout_ms: 5000,
-  });
-  assert.deepEqual(calls[0].slice(0, 3), ["browser", "ref-stale", "eval"]);
-  assert.deepEqual(calls.slice(1), [
-    ["browser", "ref-stale", "fill", "1", "x"],
-    ["browser", "ref-stale", "focus", "1"],
-    ["browser", "ref-stale", "keys", "Enter"],
-  ]);
-  assert.equal(result.data.mode, "cli-fallback");
-  assert.equal(result.data.atomic_skipped, true);
-  assert.equal(result.data.atomic_error, "target_not_found");
+test("fill_submit stops before submitting when the CLI rejects a stale numeric ref", async () => {
+  for (const target of [1, "1"]) {
+    const calls = [];
+    const staleRef = Object.assign(new Error("ref=1 points to a different element"), {
+      details: { data: { error: { code: "stale_ref" } } },
+    });
+    const run = async (args) => {
+      calls.push(args);
+      if (args[2] === "fill") throw staleRef;
+      // A DOM evaluation would blindly accept a recycled ref attribute.
+      return { data: { ok: true, filled: true, form_submitted: true } };
+    };
+    await assert.rejects(executeFillSubmit(run, {
+      session: "ref-stale",
+      target,
+      value: "x",
+      verify_navigation: false,
+    }), (error) => error === staleRef);
+    assert.deepEqual(calls, [["browser", "ref-stale", "fill", "1", "x"]]);
+  }
 });
 
 test("fill_submit event strategy skips form.submit", () => {

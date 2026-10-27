@@ -278,6 +278,52 @@ test("runner falls back to options.cwd and still honors a per-call cwd", async (
   }
 });
 
+test("runner resolves a relative JavaScript env entrypoint from options.cwd", async () => {
+  const root = makeTempRoot();
+  const callDir = makeTempRoot();
+  try {
+    const jsFile = path.join(root, "cli.js");
+    writeFileSync(jsFile, "console.log(JSON.stringify({ cwd: process.cwd(), args: process.argv.slice(2) }));");
+    const run = createOpenCliRunner({
+      cwd: root,
+      env: { ...process.env, OPENCLI_MCP_BIN: "./cli.js", OPENCLI_MCP_PREFIX_ARGS: '["--fixture"]' },
+    });
+
+    const result = await run(["probe"]);
+    assert.equal(realpathSync(result.data.cwd), realpathSync(root));
+    assert.deepEqual(result.data.args, ["--fixture", "probe"]);
+    assert.equal(realpathSync(result.invocation.args[0]), realpathSync(jsFile));
+
+    const overridden = await run([], { cwd: callDir });
+    assert.equal(realpathSync(overridden.data.cwd), realpathSync(callDir));
+    assert.equal(realpathSync(overridden.invocation.args[0]), realpathSync(jsFile));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(callDir, { recursive: true, force: true });
+  }
+});
+
+test("runner finds a parent project config from options.cwd and resolves its relative JavaScript bin", async () => {
+  const root = makeTempRoot();
+  try {
+    const nested = path.join(root, "a", "b");
+    mkdirSync(nested, { recursive: true });
+    const jsFile = path.join(root, "cli.js");
+    writeFileSync(jsFile, "console.log(JSON.stringify({ cwd: process.cwd(), args: process.argv.slice(2) }));");
+    writeFileSync(path.join(root, ".opencli-mcp.json"), JSON.stringify({ bin: "./cli.js", prefixArgs: ["--project"] }));
+    const { OPENCLI_MCP_BIN, OPENCLI_MCP_PREFIX_ARGS, ...env } = process.env;
+    const run = createOpenCliRunner({ cwd: nested, env });
+
+    const result = await run(["probe"]);
+    assert.equal(realpathSync(result.data.cwd), realpathSync(nested));
+    assert.deepEqual(result.data.args, ["--project", "probe"]);
+    assert.equal(realpathSync(result.invocation.args[0]), realpathSync(jsFile));
+    assert.equal(result.invocation.source, `.opencli-mcp.json (${path.join(root, ".opencli-mcp.json")})`);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("runner exposes a non-enumerable executionPlatform hint", () => {
   const native = createOpenCliRunner({
     resolved: { command: process.execPath, prefixArgs: [], source: "test" },

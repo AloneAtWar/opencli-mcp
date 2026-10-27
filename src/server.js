@@ -194,9 +194,9 @@ function errorResult(error) {
 
 // P2 observability: report which discovery path resolved the OpenCLI CLI. Never throws, so a
 // resolution failure degrades to extra diagnostics instead of breaking the tool call.
-function resolutionExtra(env) {
+function resolutionExtra(env, cwd) {
   try {
-    const resolved = resolveOpenCli(env);
+    const resolved = resolveOpenCli(env, { cwd });
     return {
       resolution: {
         command: resolved.command,
@@ -207,7 +207,7 @@ function resolutionExtra(env) {
   } catch (error) {
     const extra = { resolutionError: error.message };
     try {
-      extra.resolutionCandidates = describeOpenCliCandidates(env);
+      extra.resolutionCandidates = describeOpenCliCandidates(env, { cwd });
     } catch {
       // Candidate probing is best-effort diagnostics only.
     }
@@ -324,7 +324,7 @@ export function createServer(options = {}) {
       const args = doctor ? ["doctor"] : ["--version"];
       const env = mediaEnv;
       const extra = {
-        ...resolutionExtra(env),
+        ...resolutionExtra(env, mediaCwd),
         media_cache: describeMediaCache(env, mediaCwd),
         // Status keeps the same snake_case contract as media_cache; the busy map
         // is normally empty and exists for diagnosing queueing.
@@ -993,14 +993,15 @@ function startPreflight(options) {
 
   void (async () => {
     const env = options.runnerOptions?.env ?? process.env;
+    const cwd = options.runnerOptions?.cwd ?? process.cwd();
     let resolved;
     try {
-      resolved = resolveOpenCli(env);
+      resolved = resolveOpenCli(env, { cwd });
     } catch (error) {
       process.stderr.write(
         `[opencli-mcp] preflight failed: ${error.message} | fix: set OPENCLI_MCP_BIN to the OpenCLI ` +
           `executable (plus OPENCLI_MCP_PREFIX_ARGS when needed), or install OpenCLIApp` +
-          `${describeCandidatesSuffix(env)}\n`,
+          `${describeCandidatesSuffix(env, cwd)}\n`,
       );
       return;
     }
@@ -1032,9 +1033,9 @@ function describeVersion(result) {
   return "(no version output)";
 }
 
-function describeCandidatesSuffix(env) {
+function describeCandidatesSuffix(env, cwd) {
   try {
-    const candidates = describeOpenCliCandidates(env);
+    const candidates = describeOpenCliCandidates(env, { cwd });
     if (Array.isArray(candidates) && candidates.length > 0) {
       const labels = candidates
         .map((candidate) => (typeof candidate === "string" ? candidate : candidate?.source ?? candidate?.command))

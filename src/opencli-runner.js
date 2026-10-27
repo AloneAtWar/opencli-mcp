@@ -73,7 +73,9 @@ export function resolveOpenCli(env = process.env, overrides = {}) {
     if (!Array.isArray(prefixArgs) || prefixArgs.some((item) => typeof item !== "string")) {
       throw new Error(`${config.path} "prefixArgs" must be a JSON string array.`);
     }
-    const classified = classifyBin(rawBin, deps);
+    // Relative JavaScript entrypoints belong to the configuration file, so a
+    // parent or home-directory config also works when invoked from a child cwd.
+    const classified = classifyBin(rawBin, { ...deps, cwd: path.dirname(config.path) });
     return {
       command: classified.command,
       prefixArgs: [...classified.prefixArgs, ...prefixArgs],
@@ -129,7 +131,11 @@ export function classifyBin(bin, deps = defaultDeps(process.env)) {
   }
 
   if (JS_EXTENSIONS.includes(ext)) {
-    return { command: deps.execPath, prefixArgs: [path.resolve(value)], kind: "js-file" };
+    return {
+      command: deps.execPath,
+      prefixArgs: [path.resolve(deps.cwd ?? process.cwd(), value)],
+      kind: "js-file",
+    };
   }
   if (isShimExtension(ext)) throw new Error(shimMessage(bin));
   if (deps.platform === "win32" && ext === "") throw new Error(shimMessage(bin));
@@ -474,7 +480,9 @@ function resolveExecutionPlatform(command, fallback = process.platform) {
 }
 
 export function createOpenCliRunner(options = {}) {
-  const resolved = options.resolved ?? resolveOpenCli(options.env ?? process.env);
+  const resolved = options.resolved ?? resolveOpenCli(options.env ?? process.env, {
+    cwd: options.cwd ?? process.cwd(),
+  });
   const timeoutMs = options.timeoutMs ?? Number(process.env.OPENCLI_MCP_TIMEOUT_MS || DEFAULT_TIMEOUT_MS);
   const maxOutputBytes = options.maxOutputBytes ?? DEFAULT_MAX_OUTPUT_BYTES;
   const killGraceMs = options.killGraceMs ?? DEFAULT_KILL_GRACE_MS;

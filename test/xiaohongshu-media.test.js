@@ -11,7 +11,9 @@
 
 import test from "node:test";
 import assert from "node:assert/strict";
-import { mkdtemp, mkdir, writeFile, symlink, utimes, rm, readdir, lstat } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, writeFile, symlink, utimes, rm, readdir, lstat } from "node:fs/promises";
+import { fork } from "node:child_process";
+import { once } from "node:events";
 import os from "node:os";
 import path from "node:path";
 import { OpenCliError } from "../src/opencli-runner.js";
@@ -187,6 +189,38 @@ function timeoutMentioningNavigation() {
 
 function imageBlocks(result) {
   return result.content.filter((block) => block.type === "image");
+}
+
+function cacheWorker(t) {
+  const child = fork(new URL('./fixtures/media-cache-worker.js', import.meta.url), [], { stdio: ['ignore', 'pipe', 'pipe', 'ipc'] });
+  const messages = [], pending = [];
+  let stderr = '', exited = false;
+  child.stderr.on('data', chunk => { stderr += chunk; });
+  child.on('message', message => {
+    const index = pending.findIndex(waiter => waiter.type === message.type);
+    if (index < 0) messages.push(message);
+    else pending.splice(index, 1)[0].resolve(message);
+  });
+  child.on('error', error => { for (const waiter of pending.splice(0)) waiter.reject(error); });
+  child.on('exit', (code, signal) => {
+    exited = true;
+    for (const waiter of pending.splice(0)) waiter.reject(new Error(`media cache worker exited (${code ?? signal}): ${stderr}`));
+  });
+  const stop = async () => {
+    if (!exited) { const closed = once(child, 'exit'); child.kill('SIGKILL'); await closed; }
+  };
+  t.after(stop);
+  return {
+    child,
+    stop,
+    send: message => child.send(message),
+    wait(type) {
+      const index = messages.findIndex(message => message.type === type);
+      if (index >= 0) return Promise.resolve(messages.splice(index, 1)[0]);
+      if (exited) return Promise.reject(new Error(`media cache worker already exited: ${stderr}`));
+      return new Promise((resolve, reject) => pending.push({ type, resolve, reject }));
+    },
+  };
 }
 
 test("download() writes one request dir per call and reports verified absolute files", async () => {
@@ -566,6 +600,141 @@ test("concurrent downloads for the same note stay in separate request dirs", asy
     }
     assert.deepEqual(sizes.slice().sort((a, b) => a - b), [JPEG.length, PNG.length].sort((a, b) => a - b));
   } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('independent processes preserve every ownership record and reclaim the shared cache', { timeout: 30_000 }, async (t) => {
+  const root = await tempRoot('xhs-shared-cache');
+  const workers = [];
+  try {
+    await writeFile(path.join(root, 'keep.txt'), 'user data');
+    for (let i = 0; i < 6; i++) workers.push(cacheWorker(t));
+    await Promise.all(workers.map(worker => worker.wait('ready')));
+    for (const worker of workers) worker.send({ root, pauseDownload: true });
+    const started = await Promise.all(workers.map(worker => worker.wait('started')));
+    const inFlight = JSON.parse(await readFile(path.join(root, '.opencli-xhs-owned.json'), 'utf8'));
+    assert.equal(inFlight.tasks.length, workers.length, 'registration merges records from every process');
+    assert.ok(inFlight.tasks.every(task => task.quarantined), 'other processes protect every live writer');
+
+    for (const worker of workers) worker.send({ release: true });
+    const results = await Promise.all(workers.map(worker => worker.wait('result')));
+    for (const response of results) {
+      assert.equal(response.error, undefined, JSON.stringify(response.error));
+      assert.equal(response.data.status, 'success');
+      assert.deepEqual(response.data.errors, []);
+    }
+    const completed = JSON.parse(await readFile(path.join(root, '.opencli-xhs-owned.json'), 'utf8'));
+    assert.equal(completed.tasks.length, workers.length);
+    assert.ok(completed.tasks.every(task => task.quarantined === false));
+    for (const { directory } of started) assert.ok(await exists(directory));
+
+    const cleaner = cacheWorker(t);
+    workers.push(cleaner);
+    await cleaner.wait('ready');
+    cleaner.send({ root, maxMb: 1 });
+    const cleaned = await cleaner.wait('result');
+    assert.equal(cleaned.error, undefined, JSON.stringify(cleaned.error));
+    assert.equal(cleaned.data.status, 'success');
+    for (const { directory } of started) assert.equal(await exists(directory), false, 'old tasks from every process are reclaimed');
+    const retained = JSON.parse(await readFile(path.join(root, '.opencli-xhs-owned.json'), 'utf8'));
+    assert.deepEqual(retained.tasks.map(task => task.name), [path.basename(cleaned.data.output_directory)]);
+    assert.ok(await exists(cleaned.data.files[0].local_path));
+    assert.equal(await readFile(path.join(root, 'keep.txt'), 'utf8'), 'user data');
+  } finally {
+    await Promise.all(workers.map(worker => worker.stop()));
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('another process cannot reclaim an image while its inventory is being read', { timeout: 15_000 }, async (t) => {
+  const root = await tempRoot('xhs-shared-reader');
+  const reader = cacheWorker(t), cleaner = cacheWorker(t);
+  try {
+    await Promise.all([reader.wait('ready'), cleaner.wait('ready')]);
+    reader.send({ root, operation: 'images', pauseInventory: true });
+    const { directory } = await reader.wait('started');
+    await reader.wait('reading');
+    cleaner.send({ root, maxMb: 1 });
+    const cleaned = await cleaner.wait('result');
+    assert.equal(cleaned.error, undefined, JSON.stringify(cleaned.error));
+    assert.ok(await exists(path.join(directory, 'note', 'note_1.jpg')), 'shared cleanup protects another process reading images');
+    const owned = JSON.parse(await readFile(path.join(root, '.opencli-xhs-owned.json'), 'utf8'));
+    assert.equal(owned.tasks.find(task => task.name === path.basename(directory)).quarantined, true);
+    reader.send({ release: true });
+    const images = await reader.wait('result');
+    assert.equal(images.error, undefined, JSON.stringify(images.error));
+    assert.equal(images.data.status, 'success');
+    assert.equal(images.data.images.length, 1);
+  } finally {
+    await Promise.all([reader.stop(), cleaner.stop()]);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('an expired lock left by a killed process is recovered without losing media records', { timeout: 15_000 }, async (t) => {
+  const root = await tempRoot('xhs-crashed-lock');
+  const holder = cacheWorker(t), next = cacheWorker(t);
+  try {
+    const { media } = makeMedia([{ noteId: 'before', files: [{ name: 'before_1.jpg', bytes: JPEG }] }], { cwd: root });
+    const previous = await media.download({ note_url: 'https://xhslink.com/a' });
+    await Promise.all([holder.wait('ready'), next.wait('ready')]);
+    holder.send({ root, operation: 'hold_lock' });
+    await holder.wait('held');
+    await holder.stop(); // SIGKILL bypasses proper-lockfile's graceful-exit cleanup.
+    const lockPath = path.join(root, '.opencli-xhs-owned.json.lock');
+    assert.ok(await exists(lockPath));
+    // Simulate the stale interval passing after the real holder has crashed.
+    await utimes(lockPath, new Date(0), new Date(0));
+    next.send({ root });
+    const response = await next.wait('result');
+    assert.equal(response.error, undefined, JSON.stringify(response.error));
+    assert.equal(response.data.status, 'success');
+    const owned = JSON.parse(await readFile(path.join(root, '.opencli-xhs-owned.json'), 'utf8'));
+    assert.equal(owned.tasks.length, 2);
+    assert.ok(await exists(previous.structuredContent.files[0].local_path));
+    assert.equal(await exists(lockPath), false, 'the recovered lock is released normally');
+  } finally {
+    await Promise.all([holder.stop(), next.stop()]);
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('a failed inventory releases temporary cross-process read protection', { timeout: 15_000 }, async (t) => {
+  const root = await tempRoot('xhs-failed-reader');
+  const worker = cacheWorker(t);
+  try {
+    await worker.wait('ready');
+    worker.send({ root, operation: 'images', failInventory: true });
+    const response = await worker.wait('result');
+    assert.equal(response.error.code, 'EACCES');
+    const owned = JSON.parse(await readFile(path.join(root, '.opencli-xhs-owned.json'), 'utf8'));
+    assert.equal(owned.tasks.length, 1);
+    assert.equal(owned.tasks[0].quarantined, false, 'a settled writer is not permanently quarantined because reading failed');
+  } finally {
+    await worker.stop();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('a compromised cache lock fails the transaction without exiting the MCP process', { timeout: 15_000 }, async (t) => {
+  const root = await tempRoot('xhs-compromised-lock');
+  const worker = cacheWorker(t);
+  try {
+    const original = { version: 1, tasks: [] };
+    await writeFile(path.join(root, '.opencli-xhs-owned.json'), JSON.stringify(original));
+    await worker.wait('ready');
+    worker.send({ root, pauseManifest: true });
+    await worker.wait('paused');
+    await rm(path.join(root, '.opencli-xhs-owned.json.lock'), { recursive: true });
+    const compromised = await worker.wait('compromised');
+    assert.equal(compromised.code, 'ECOMPROMISED');
+    worker.send({ release: true });
+    const response = await worker.wait('result');
+    assert.equal(response.error.code, 'ECOMPROMISED', 'the caller receives the lock failure as an ordinary rejected transaction');
+    assert.deepEqual(JSON.parse(await readFile(path.join(root, '.opencli-xhs-owned.json'), 'utf8')), original, 'a transaction that lost its lock cannot publish a replacement manifest');
+  } finally {
+    await worker.stop();
     await rm(root, { recursive: true, force: true });
   }
 });

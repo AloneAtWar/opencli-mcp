@@ -8,6 +8,36 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { createServer } from "../src/server.js";
 import { OpenCliError } from "../src/opencli-runner.js";
 
+test("opencli_status resolves the same project config as runner cwd", async () => {
+  const root = await mkdtemp(path.join(os.tmpdir(), "opencli-status-cwd-"));
+  const cwd = path.join(root, "nested");
+  const entry = path.join(root, "cli.mjs");
+  await mkdir(cwd);
+  await writeFile(entry, 'console.log(JSON.stringify("cwd-fixture"));');
+  await writeFile(path.join(root, ".opencli-mcp.json"), JSON.stringify({ bin: "./cli.mjs" }));
+  const server = createServer({
+    runnerOptions: {
+      cwd,
+      env: { ...process.env, OPENCLI_MCP_BIN: "", OPENCLI_MCP_PREFIX_ARGS: "" },
+    },
+  });
+  const client = new Client({ name: "status-cwd-test", version: "1.0" });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  try {
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    const status = await client.callTool({ name: "opencli_status", arguments: {} });
+    assert.notEqual(status.isError, true);
+    assert.equal(status.structuredContent.value, "cwd-fixture");
+    assert.deepEqual(status.structuredContent.resolution.prefixArgs, [entry]);
+    assert.match(status.structuredContent.resolution.source, /\.opencli-mcp\.json/);
+  } finally {
+    await client.close();
+    await server.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("opencli_status reports the effective media cache and the opt-in trace records tool names", async () => {
   const root = await mkdtemp(path.join(os.tmpdir(), "xhs-status-"));
   const trace = path.join(root, "calls.jsonl");

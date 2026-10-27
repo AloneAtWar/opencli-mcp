@@ -44,11 +44,12 @@ export async function executeFillSubmit(run, input, options = {}) {
   const key = input.key ?? "Enter";
   const submitStrategy = input.submit_strategy ?? "form";
   const refTarget = isRefTarget(input.target);
-  const atomicTarget = refTarget ? refTargetToSelector(input.target) : input.target;
+  const target = refTarget && typeof input.target === "string" ? input.target.trim() : input.target;
 
-  let atomicError = null;
-  if (atomicTarget !== undefined && atomicTarget !== null && input.atomic !== false) {
-    const expression = buildFillSubmitExpression({ ...input, target: atomicTarget, key, submit_strategy: submitStrategy });
+  // Numeric refs must go through OpenCLI's resolver: an annotated DOM node can
+  // survive a re-render while its identity has changed since the snapshot.
+  if (!refTarget && typeof target === "string" && input.atomic !== false) {
+    const expression = buildFillSubmitExpression({ ...input, target, key, submit_strategy: submitStrategy });
     const args = browserArgs(session, "eval", expression);
     appendTab(args, input.tab);
     const result = await run(args, { timeoutMs });
@@ -56,19 +57,13 @@ export async function executeFillSubmit(run, input, options = {}) {
     if (data?.ok) {
       return { ...result, data: { ...data, mode: "atomic-dom-event" } };
     }
-    // A stale numeric ref (its data-opencli-ref attribute is gone) can still be
-    // submitted through the CLI path; a bad CSS selector is a hard failure.
-    if (refTarget && data?.error === "target_not_found") {
-      atomicError = data.error;
-    } else {
-      const diagnosis = diagnoseFillSubmit(data, input);
-      throw Object.assign(new Error(`fill_submit failed: ${data?.error || "unknown DOM error"}`), { diagnosis });
-    }
+    const diagnosis = diagnoseFillSubmit(data, input);
+    throw Object.assign(new Error(`fill_submit failed: ${data?.error || "unknown DOM error"}`), { diagnosis });
   }
 
   const shared = {
     session,
-    target: input.target,
+    target,
     role: input.role,
     name: input.name,
     label: input.label,
@@ -81,7 +76,9 @@ export async function executeFillSubmit(run, input, options = {}) {
   const verifyNavigation = input.verify_navigation !== false;
   const readUrl = async () => {
     try {
-      const result = await run(browserArgs(session, "get", "url"), { timeoutMs: remainingMs(deadline, timeoutMs) });
+      const args = browserArgs(session, "get", "url");
+      appendTab(args, input.tab);
+      const result = await run(args, { timeoutMs: remainingMs(deadline, timeoutMs) });
       const data = result.data;
       if (typeof data === "string") return data;
       return data?.value ?? data?.url ?? null;
@@ -118,7 +115,6 @@ export async function executeFillSubmit(run, input, options = {}) {
     url_after: urlAfter,
     warnings,
   };
-  if (atomicError) data.atomic_error = atomicError;
   return { data };
 }
 
