@@ -9,6 +9,7 @@ const transport = new StdioClientTransport({
   command: process.execPath,
   args: [path.join(root, "bin", "opencli-mcp.js")],
   stderr: "inherit",
+  env: process.env,
 });
 const client = new Client({ name: "opencli-browser-smoke", version: "0.1.0" });
 

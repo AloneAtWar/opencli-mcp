@@ -157,3 +157,40 @@ test("skips optional failures without looping", async () => {
   assert.equal(result.trace[0].status, "skipped");
   assert.equal(calls, 3);
 });
+
+// Page text is full of emoji, and slicing it by UTF-16 code unit used to leave a
+// lone surrogate behind - which the tunnel control plane rejects with HTTP 400,
+// killing the whole MCP session. The budget stays in code units; the cut point
+// just has to land on a code point boundary.
+test("compaction never splits a surrogate pair", () => {
+  const emoji = "👍";
+  const raw = `URL: https://example.com\n${`内容${emoji}看板\n`.repeat(30)}`;
+  // Budgets below the raw size exercise the truncating branches (including odd
+  // limits, which land inside a pair); larger ones take the "everything fits"
+  // early return but must still come out well-formed.
+  for (const maxChars of [101, 102, 103, 104, 105, 294, 295, 296, 604]) {
+    const result = compactSnapshotData(raw, { maxChars, maxLines: 500 });
+    assert.equal(result.value.isWellFormed(), true, `maxChars ${maxChars} well-formed`);
+    // A clean cut drops the half character; it never needs a replacement char.
+    assert.equal(result.value.includes("\uFFFD"), false, `maxChars ${maxChars} repaired`);
+    if (result.compacted) assert.ok(result.value.length <= maxChars, `maxChars ${maxChars} budget`);
+  }
+});
+
+// The compaction budget reserves room for its marker, so in practice it never
+// reaches its `slice` - this preview does, and it used to end a flow step's
+// summary on half an emoji (measured: tail "\udc4d\ud83d", not well-formed).
+test("flow result previews never cut a surrogate pair", async () => {
+  const run = async () => ({ data: `x${"👍".repeat(200)}` });
+  const result = await executeBrowserFlow(run, {
+    session: "preview",
+    max_steps: 2,
+    max_total_ms: 5000,
+    steps: [{ id: "snap", operation: "snapshot", max_chars: 12_000 }],
+  });
+
+  const summary = result.trace[0].result;
+  assert.equal(summary.chars, 401);
+  assert.equal(summary.preview.isWellFormed(), true);
+  assert.equal(summary.preview, `x${"👍".repeat(119)}`);
+});

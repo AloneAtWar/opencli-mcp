@@ -1,5 +1,7 @@
 // browser-diagnostics.js — 通用失败诊断，不针对任何特定网站
 
+import { cutHead } from "./text-safe.js";
+
 /**
  * 诊断 collect 为什么返回 0 条结果
  */
@@ -90,9 +92,9 @@ export function diagnoseWaitTimeout(lastState, conditions, timeoutMs) {
       if (cond.type === "selector") {
         diagnosis.suggestions.push(`Selector "${cond.value}" not found. Try browser_snapshot to verify.`);
       } else if (cond.type === "text") {
-        diagnosis.suggestions.push(`Text "${cond.value.slice(0, 50)}" not found. It may be in a lazily-loaded section.`);
+        diagnosis.suggestions.push(`Text "${cutHead(cond.value, 50)}" not found. It may be in a lazily-loaded section.`);
       } else if (cond.type === "url_contains") {
-        diagnosis.suggestions.push(`URL does not contain "${cond.value}". Current: ${lastState.url?.slice(0, 80)}`);
+        diagnosis.suggestions.push(`URL does not contain "${cond.value}". Current: ${cutHead(lastState.url, 80)}`);
       }
     }
   }

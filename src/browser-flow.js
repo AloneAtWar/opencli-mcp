@@ -9,6 +9,7 @@ import {
   buildActionArgs,
   normalizeSession,
 } from "./commands.js";
+import { cutHead } from "./text-safe.js";
 
 const DEFAULT_STEP_TIMEOUT_MS = 10_000;
 
@@ -88,12 +89,12 @@ export function compactSnapshotData(data, options = {}) {
         remaining -= cost;
       }
     }
-    const value = kept.map((l) => l.text).join("\n").replace(/\n{4,}/g, "\n\n\n").slice(0, maxChars);
+    const value = cutHead(kept.map((l) => l.text).join("\n").replace(/\n{4,}/g, "\n\n\n"), maxChars);
     const omittedChars = Math.max(0, data.length - value.length);
     const marker = omittedChars > 0 ? `\n---\n[compact snapshot: omitted ${omittedChars} char(s); content preserved, chrome trimmed]\n---\n` : "";
-    const final = value.length > maxChars ? value.slice(0, maxChars) : value + marker;
+    const final = value.length > maxChars ? cutHead(value, maxChars) : value + marker;
     return {
-      value: final.slice(0, maxChars),
+      value: cutHead(final, maxChars),
       compacted: true,
       originalChars: data.length,
       returnedChars: Math.min(final.length, maxChars),
@@ -116,7 +117,7 @@ export function compactSnapshotData(data, options = {}) {
 
   const value = kept.map((l) => l.text).join("\n").replace(/\n{4,}/g, "\n\n\n");
   const marker = `\n---\n[compact snapshot: kept ${kept.length}/${contentLines.length} content lines, ${chromeLines.length} chrome lines omitted; ${(data.length - value.length)} chars omitted]\n---\n`;
-  const final = value.slice(0, Math.max(0, maxChars - marker.length)) + marker;
+  const final = cutHead(value, Math.max(0, maxChars - marker.length)) + marker;
 
   return {
     value: final,
@@ -240,7 +241,7 @@ function variableValue(data) {
 }
 
 function resultSummary(data) {
-  if (typeof data === "string") return { type: "text", chars: data.length, preview: data.slice(0, 240) };
+  if (typeof data === "string") return { type: "text", chars: data.length, preview: cutHead(data, 240) };
   if (Array.isArray(data)) return { type: "array", count: data.length };
   if (data && typeof data === "object") {
     return {

@@ -1,6 +1,7 @@
 import { createMcpExpressApp } from "@modelcontextprotocol/sdk/server/express.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { createServer } from "./server.js";
+import { createSiteGate } from "./site-gate.js";
 
 export function startHttpServer(options = {}) {
   const host = options.host ?? process.env.OPENCLI_MCP_HOST ?? "127.0.0.1";
@@ -12,13 +13,18 @@ export function startHttpServer(options = {}) {
     throw new Error("Refusing a non-loopback bind. Set OPENCLI_MCP_ALLOW_REMOTE=1 only if you add external authentication.");
   }
 
+  // This transport is stateless: every POST /mcp builds a fresh MCP server. The
+  // gate must be created once per process and injected into each of them, or
+  // concurrent requests would each count alone and the limit would never apply.
+  const siteGate = options.siteGate ?? createSiteGate({ env: options.runnerOptions?.env ?? process.env });
+
   const app = createMcpExpressApp({ host });
   app.get("/health", (_req, res) => {
     res.json({ ok: true, name: "opencli-mcp", transport: "streamable-http" });
   });
 
   app.post("/mcp", async (req, res) => {
-    const mcpServer = createServer(options);
+    const mcpServer = createServer({ ...options, siteGate });
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     let closed = false;
     const cleanup = async () => {

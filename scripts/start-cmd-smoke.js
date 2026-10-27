@@ -8,6 +8,7 @@ const transport = new StdioClientTransport({
   command: process.env.ComSpec || "cmd.exe",
   args: ["/d", "/s", "/c", path.join(root, "start.cmd")],
   stderr: "inherit",
+  env: process.env,
 });
 const client = new Client({ name: "start-cmd-smoke", version: "0.1.0" });
 try {

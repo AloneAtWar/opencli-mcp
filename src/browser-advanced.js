@@ -1,5 +1,5 @@
 import { performance } from "node:perf_hooks";
-import { appendTab, browserArgs, buildActionArgs } from "./commands.js";
+import { appendOption, appendTab, browserArgs, buildActionArgs } from "./commands.js";
 import {
   diagnoseCollect,
   diagnoseFillSubmit,
@@ -20,6 +20,19 @@ function unwrapEval(data) {
   return data;
 }
 
+// OpenCLI materializes every allocated snapshot/find ref in the live DOM as the
+// attribute `data-opencli-ref`, so a numeric ref can be expressed as CSS.
+export function isRefTarget(target) {
+  if (typeof target === "number") return Number.isInteger(target);
+  if (typeof target === "string") return /^\d+$/.test(target.trim());
+  return false;
+}
+
+export function refTargetToSelector(target) {
+  const ref = typeof target === "number" ? target : String(target).trim();
+  return `[data-opencli-ref="${ref}"]`;
+}
+
 // ─────────────────────────────────────────────
 // fill_submit
 // ─────────────────────────────────────────────
@@ -30,23 +43,27 @@ export async function executeFillSubmit(run, input, options = {}) {
   const session = input.session;
   const key = input.key ?? "Enter";
   const submitStrategy = input.submit_strategy ?? "form";
+  const refTarget = isRefTarget(input.target);
+  const target = refTarget && typeof input.target === "string" ? input.target.trim() : input.target;
 
-  if (typeof input.target === "string" && input.atomic !== false) {
-    const expression = buildFillSubmitExpression({ ...input, key, submit_strategy: submitStrategy });
+  // Numeric refs must go through OpenCLI's resolver: an annotated DOM node can
+  // survive a re-render while its identity has changed since the snapshot.
+  if (!refTarget && typeof target === "string" && input.atomic !== false) {
+    const expression = buildFillSubmitExpression({ ...input, target, key, submit_strategy: submitStrategy });
     const args = browserArgs(session, "eval", expression);
     appendTab(args, input.tab);
     const result = await run(args, { timeoutMs });
     const data = unwrapEval(result.data);
-    if (!data?.ok) {
-      const diagnosis = diagnoseFillSubmit(data, input);
-      throw Object.assign(new Error(`fill_submit failed: ${data?.error || "unknown DOM error"}`), { diagnosis });
+    if (data?.ok) {
+      return { ...result, data: { ...data, mode: "atomic-dom-event" } };
     }
-    return { ...result, data: { ...data, mode: "atomic-dom-event" } };
+    const diagnosis = diagnoseFillSubmit(data, input);
+    throw Object.assign(new Error(`fill_submit failed: ${data?.error || "unknown DOM error"}`), { diagnosis });
   }
 
   const shared = {
     session,
-    target: input.target,
+    target,
     role: input.role,
     name: input.name,
     label: input.label,
@@ -56,11 +73,49 @@ export async function executeFillSubmit(run, input, options = {}) {
     tab: input.tab,
   };
 
+  const verifyNavigation = input.verify_navigation !== false;
+  const readUrl = async () => {
+    try {
+      const args = browserArgs(session, "get", "url");
+      appendTab(args, input.tab);
+      const result = await run(args, { timeoutMs: remainingMs(deadline, timeoutMs) });
+      const data = result.data;
+      if (typeof data === "string") return data;
+      return data?.value ?? data?.url ?? null;
+    } catch {
+      return null;
+    }
+  };
+
+  const urlBefore = verifyNavigation ? await readUrl() : null;
   const fill = await run(buildActionArgs({ ...shared, action: "fill", value: input.value }), { timeoutMs: remainingMs(deadline, timeoutMs) });
   const focus = await run(buildActionArgs({ ...shared, action: "focus" }), { timeoutMs: remainingMs(deadline, timeoutMs) });
   const keys = await run(buildActionArgs({ session, action: "keys", key, tab: input.tab }), { timeoutMs: remainingMs(deadline, timeoutMs) });
+  const urlAfter = verifyNavigation ? await readUrl() : null;
 
-  return { data: { filled: fill.data, focused: focus.data, submitted: keys.data, key, mode: "cli-fallback" } };
+  const focusOk = focus?.data?.focused !== false;
+  const warnings = [];
+  if (!focusOk) warnings.push("focus_failed");
+  let submitVerified = null;
+  if (verifyNavigation) {
+    submitVerified = Boolean(urlBefore) && Boolean(urlAfter) && urlBefore !== urlAfter;
+    if (!submitVerified) warnings.push("submit_not_verified");
+  }
+
+  const data = {
+    filled: fill.data,
+    focused: focus.data,
+    submitted: keys.data,
+    key,
+    mode: "cli-fallback",
+    atomic_skipped: true,
+    focus_ok: focusOk,
+    submit_verified: submitVerified,
+    url_before: urlBefore,
+    url_after: urlAfter,
+    warnings,
+  };
+  return { data };
 }
 
 export function buildFillSubmitExpression(input) {
@@ -136,12 +191,12 @@ export function buildCollectExpression(input) {
     exclude: input.exclude ?? null,
   };
   const encoded = JSON.stringify(config);
-  return `(()=>{const config=${encoded};const all=[...document.querySelectorAll(config.selector)];const roots=all.slice(config.offset,config.offset+config.limit);const read=(root,field)=>{let element=root;if(field.selector){try{element=root.matches(field.selector)?root:root.querySelector(field.selector);}catch{return null;}}if(!element)return null;let value=null;if(field.property==='href')value=element.href||element.getAttribute('href');else if(field.property==='src')value=element.src||element.getAttribute('src');else if(field.property==='value')value=element.value??element.getAttribute('value');else if(field.property==='html')value=element.innerHTML;else if(field.property==='attribute')value=element.getAttribute(field.attribute);else value=(element.innerText||element.textContent||'').trim();if((value===null||value==='')&&config.fallbackText&&field.property!=='href'&&field.property!=='src'&&field.property!=='html'){value=(root.innerText||root.textContent||'').trim();}if(typeof value==='string'&&value.length>config.maxFieldChars)value=value.slice(0,config.maxFieldChars);return value;};const matchesExclude=(item)=>{if(!config.exclude)return false;const ec=config.exclude;if(ec.title_contains&&item.title&&ec.title_contains.some(p=>item.title.includes(p)))return true;if(ec.href_contains&&item.href&&ec.href_contains.some(p=>item.href.includes(p)))return true;if(ec.text_contains&&ec.text_contains.some(p=>(item.title||'').includes(p)||(item.desc||'').includes(p)))return true;return false;};let items=roots.map((root,index)=>{const item={_index:config.offset+index};for(const field of config.fields)item[field.name]=read(root,field);return item;}).filter(item=>config.requiredFields.every(name=>item[name]!==null&&item[name]!==undefined&&String(item[name]).trim()!==''));if(matchesExclude)items=items.filter(item=>!matchesExclude(item));if(config.deduplicateBy){const seen=new Set();items=items.filter(item=>{const key=String(item[config.deduplicateBy]||'');if(seen.has(key))return false;seen.add(key);return true;});}return {selector:config.selector,scanned:roots.length,total_roots:all.length,offset:config.offset,limit:config.limit,count:items.length,deduplicated:config.deduplicateBy?true:false,items};})()`;
+  return `(()=>{const config=${encoded};const cut=(s,n)=>{s=String(s);if(s.length<=n)return s;const c=s.charCodeAt(n-1);return c>=0xD800&&c<=0xDBFF?s.slice(0,n-1):s.slice(0,n);};const all=[...document.querySelectorAll(config.selector)];const roots=all.slice(config.offset,config.offset+config.limit);const read=(root,field)=>{let element=root;if(field.selector){try{element=root.matches(field.selector)?root:root.querySelector(field.selector);}catch{return null;}}if(!element)return null;let value=null;if(field.property==='href')value=element.href||element.getAttribute('href');else if(field.property==='src')value=element.src||element.getAttribute('src');else if(field.property==='value')value=element.value??element.getAttribute('value');else if(field.property==='html')value=element.innerHTML;else if(field.property==='attribute')value=element.getAttribute(field.attribute);else value=(element.innerText||element.textContent||'').trim();if((value===null||value==='')&&config.fallbackText&&field.property!=='href'&&field.property!=='src'&&field.property!=='html'){value=(root.innerText||root.textContent||'').trim();}if(typeof value==='string'&&value.length>config.maxFieldChars)value=cut(value,config.maxFieldChars);return value;};const matchesExclude=(item)=>{if(!config.exclude)return false;const ec=config.exclude;if(ec.title_contains&&item.title&&ec.title_contains.some(p=>item.title.includes(p)))return true;if(ec.href_contains&&item.href&&ec.href_contains.some(p=>item.href.includes(p)))return true;if(ec.text_contains&&ec.text_contains.some(p=>(item.title||'').includes(p)||(item.desc||'').includes(p)))return true;return false;};let items=roots.map((root,index)=>{const item={_index:config.offset+index};for(const field of config.fields)item[field.name]=read(root,field);return item;}).filter(item=>config.requiredFields.every(name=>item[name]!==null&&item[name]!==undefined&&String(item[name]).trim()!==''));if(matchesExclude)items=items.filter(item=>!matchesExclude(item));if(config.deduplicateBy){const seen=new Set();items=items.filter(item=>{const key=String(item[config.deduplicateBy]||'');if(seen.has(key))return false;seen.add(key);return true;});}return {selector:config.selector,scanned:roots.length,total_roots:all.length,offset:config.offset,limit:config.limit,count:items.length,deduplicated:config.deduplicateBy?true:false,items};})()`;
 }
 
 function buildDiscoverExpression(input) {
   const encoded = JSON.stringify({ probeSelectors: input.probe_selectors ?? [], limit: input.limit ?? 5 });
-  return `(()=>{const config=${encoded};function probe(selector){try{const all=document.querySelectorAll(selector);if(all.length<2)return null;const tagCounts={};[...all].forEach(el=>{tagCounts[el.tagName]=(tagCounts[el.tagName]||0)+1;});const mostCommon=Object.entries(tagCounts).sort((a,b)=>b[1]-a[1])[0];const items=[...all].slice(0,3).map(el=>{const h3=el.querySelector('h3');const title=(h3||el).innerText.trim().slice(0,120);const href=el.querySelector('a')?.href||'';const firstSpan=el.querySelector('span')?.innerText?.trim().slice(0,200)||'';return {title,href,preview:firstSpan};});return {selector,matches:all.length,dominant_tag:mostCommon?.[0]||'unknown',items};}catch{return null;}}const probeSelectors=['section','article','li','[role=listitem]','[role=article]','.result','.c-container','.item','.card','.post','.feed-item','.search-result'];const customProbes=config.probeSelectors.filter(s=>typeof s==='string'&&s.length>0);const allProbes=[...customProbes,...probeSelectors.filter(s=>!customProbes.includes(s))];const candidates=[];for(const s of allProbes){const r=probe(s);if(r&&r.items.some(i=>i.title.length>2))candidates.push(r);if(candidates.length>=config.limit)break;}return {mode:'discover',probed:allProbes.length,candidates,tip:candidates.length===0?'No repeated patterns found. Try browser_snapshot to inspect the DOM structure.':'Use browser_collect with a candidate selector and field mappings based on the samples above.'};})()`;
+  return `(()=>{const config=${encoded};const cut=(s,n)=>{s=String(s);if(s.length<=n)return s;const c=s.charCodeAt(n-1);return c>=0xD800&&c<=0xDBFF?s.slice(0,n-1):s.slice(0,n);};function probe(selector){try{const all=document.querySelectorAll(selector);if(all.length<2)return null;const tagCounts={};[...all].forEach(el=>{tagCounts[el.tagName]=(tagCounts[el.tagName]||0)+1;});const mostCommon=Object.entries(tagCounts).sort((a,b)=>b[1]-a[1])[0];const items=[...all].slice(0,3).map(el=>{const h3=el.querySelector('h3');const title=cut((h3||el).innerText.trim(),120);const href=el.querySelector('a')?.href||'';const firstSpan=cut(el.querySelector('span')?.innerText?.trim()??'',200);return {title,href,preview:firstSpan};});return {selector,matches:all.length,dominant_tag:mostCommon?.[0]||'unknown',items};}catch{return null;}}const probeSelectors=['section','article','li','[role=listitem]','[role=article]','.result','.c-container','.item','.card','.post','.feed-item','.search-result'];const customProbes=config.probeSelectors.filter(s=>typeof s==='string'&&s.length>0);const allProbes=[...customProbes,...probeSelectors.filter(s=>!customProbes.includes(s))];const candidates=[];for(const s of allProbes){const r=probe(s);if(r&&r.items.some(i=>i.title.length>2))candidates.push(r);if(candidates.length>=config.limit)break;}return {mode:'discover',probed:allProbes.length,candidates,tip:candidates.length===0?'No repeated patterns found. Try browser_snapshot to inspect the DOM structure.':'Use browser_collect with a candidate selector and field mappings based on the samples above.'};})()`;
 }
 
 export async function executeCollect(run, input, options = {}) {
@@ -194,26 +249,47 @@ export async function executeCollect(run, input, options = {}) {
 export async function executeRead(run, input, options = {}) {
   const timeoutMs = options.timeoutMs ?? input.timeout_ms ?? 10_000;
   const session = input.session;
-  const selector = input.selector;
+  // Sibling tools (`browser_get`/`browser_find`/`browser_action`) use `target`;
+  // `browser_read` historically used `selector`. Accept both.
+  const target = input.target ?? input.selector;
   const property = input.property ?? "text";
   const autoRetry = input.auto_scroll_retry !== false;
+  const nth = input.nth;
+  const isHtml = property === "html";
+  // `get html` takes no positional target and no --nth; it scopes by --selector.
+  // A numeric ref maps to its materialized DOM attribute.
+  const targetCss = isRefTarget(target) ? refTargetToSelector(target) : target;
 
-  const doRead = async (sel) => {
+  const doRead = async () => {
     const args = browserArgs(session, "get", property);
-    if (sel) args.push(String(sel));
+    if (isHtml) {
+      appendOption(args, "--selector", targetCss);
+    } else {
+      if (target !== undefined && target !== null && target !== "") args.push(String(target));
+      if (nth !== undefined) appendOption(args, "--nth", nth);
+    }
     appendTab(args, input.tab);
-    const result = await run(args, { timeoutMs });
-    return result;
+    return await run(args, { timeoutMs });
   };
 
-  let result = await doRead(selector);
-  let data = result.data;
+  // text/value/attributes emit a `{value, matches_n, match_level}` envelope;
+  // html emits a raw string with no envelope.
+  const unwrapGet = (result) => {
+    const data = result.data;
+    if (!isHtml && data && typeof data === "object" && !Array.isArray(data) && "value" in data) {
+      return { value: data.value, matchesN: data.matches_n };
+    }
+    return { value: data, matchesN: undefined };
+  };
+
+  let result = await doRead();
+  let { value, matchesN } = unwrapGet(result);
 
   // 检查是否为 null/空
-  const isNull = data === null || data === undefined || data === "null";
-  const isEmpty = typeof data === "string" && data.trim() === "" && property === "text";
+  const isNull = value === null || value === undefined || value === "null";
+  const isEmpty = typeof value === "string" && value.trim() === "" && property === "text";
 
-  if ((isNull || isEmpty) && autoRetry && selector) {
+  if ((isNull || isEmpty) && autoRetry && targetCss) {
     // 滚动触发懒加载
     const scrollArgs = browserArgs(session, "state", "--scroll", "down");
     appendTab(scrollArgs, input.tab);
@@ -224,7 +300,7 @@ export async function executeRead(run, input, options = {}) {
     }
 
     // 等待元素出现
-    const waitExpr = `Boolean(document.querySelector(${JSON.stringify(selector)}))`;
+    const waitExpr = `Boolean(document.querySelector(${JSON.stringify(targetCss)}))`;
     const waitDeadline = performance.now() + Math.min(timeoutMs, 5_000);
     while (performance.now() < waitDeadline) {
       await sleep(300);
@@ -240,21 +316,39 @@ export async function executeRead(run, input, options = {}) {
     }
 
     // 重试读取
-    result = await doRead(selector);
-    data = result.data;
+    result = await doRead();
+    ({ value, matchesN } = unwrapGet(result));
   }
 
   // 诊断
-  if (data === null || data === undefined || data === "null") {
-    const diagnosis = diagnoseGetNull(data, input);
-    return { ...result, data: { value: null, property, diagnosis } };
+  if (value === null || value === undefined || value === "null") {
+    const diagnosis = diagnoseGetNull(value, { ...input, selector: targetCss });
+    return { ...result, data: { property, value: null, diagnosis } };
   }
-  if (typeof data === "string" && data.trim() === "" && property === "text") {
-    const diagnosis = diagnoseGetNull(data, input);
-    return { ...result, data: { value: "", property, diagnosis } };
+  if (typeof value === "string" && value.trim() === "" && property === "text") {
+    const diagnosis = diagnoseGetNull(value, { ...input, selector: targetCss });
+    return { ...result, data: { property, value: "", diagnosis } };
   }
 
-  return { ...result, data: { value: data, property, chars: typeof data === "string" ? data.length : undefined } };
+  const data = { property, value, chars: typeof value === "string" ? value.length : undefined };
+
+  if (isHtml) {
+    // `get html` has no --nth; surface that a requested nth was ignored.
+    if (nth !== undefined) {
+      data.nth_ignored = true;
+      data.note = "property 'html' has no --nth; nth was ignored.";
+    }
+  } else {
+    if (matchesN !== undefined) data.matches_n = matchesN;
+    if (nth !== undefined) {
+      data.nth = nth;
+    } else if (typeof matchesN === "number" && matchesN > 1) {
+      data.ambiguous_selector = true;
+      data.hint = `Selector matched ${matchesN} elements; the value returned is the first match. Pass nth (0-based) to pick one, or use a more specific selector.`;
+    }
+  }
+
+  return { ...result, data };
 }
 
 // ─────────────────────────────────────────────
@@ -263,8 +357,8 @@ export async function executeRead(run, input, options = {}) {
 
 export async function executeOpen(run, input, options = {}) {
   const timeoutMs = options.timeoutMs ?? input.timeout_ms ?? 15_000;
-  const args = ["open", input.url];
-  if (input.window) args.push("--window", input.window);
+  const args = browserArgs(input.session, "open", input.url);
+  appendOption(args, "--window", input.window);
   appendTab(args, input.tab);
   try {
     return await run(args, { timeoutMs });
